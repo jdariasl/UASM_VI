@@ -1,0 +1,53 @@
+# -----------------------------------------------------------------------
+# Config: Chest X-ray  +  Bayesian EfficientNet-B6
+#
+# Datasets
+# --------
+# Classification : COVIDx (3 classes: normal / pneumonia / COVID-19)
+# Saliency eval  : COVID-QU-Ex  (pixel-level infection masks)
+#
+# Source         : https://www.kaggle.com/datasets/andyczhang/covidx-cxr2
+#                  COVID-QU-Ex: https://www.kaggle.com/datasets/cf77495cfebe2e9b1e7b7a3a0e0e6e9f7e9c1c1a
+# -----------------------------------------------------------------------
+
+# --- Model ---
+backbone    : efficientnet_b6
+bayesian    : true
+n_classes   : 3
+estimator   : Reparameterization   # or Flipout
+moped_delta : 0.5
+
+# Optional: warm-start BNN from a pretrained deterministic checkpoint.
+# Train the deterministic EfficientNet first, then pass that checkpoint here.
+saved_model : ""
+
+# Path to the saved BNN checkpoint for explain.py
+checkpoint  : checkpoints/chestxray_efficientnet/best_model.pt
+
+# --- Data ---
+dataset     : covidx
+data_root   : data/COVIDx
+# Uncomment to enable saliency evaluation with COVID-QU-Ex masks:
+# mask_root : data/COVID-QU-Ex/masks
+
+# --- Training ---
+epochs      : 30
+batch_size  : 16
+lr          : 1e-4
+weight_decay: 1e-5
+kl_weight   : 1.0
+
+# MC samples for validation/test prediction
+n_mc_eval   : 5
+
+# --- LRP explainability ---
+lrp_eps     : 1e-6
+
+# --- IG explainability ---
+n_samples   : 20        # K weight samples
+m_steps     : 50        # path interpolation steps
+baseline    : black     # black | white | mean
+
+# --- Training output ---
+checkpoint_dir : checkpoints/chestxray_efficientnet
+num_workers    : 4
