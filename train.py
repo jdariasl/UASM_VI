@@ -192,8 +192,8 @@ def main(cfg: dict):
         raise ValueError(f"Unknown dataset '{dataset}'")
 
     # ---- Optimiser ----
-    optimizer = optim.Adam(model.parameters(), lr=cfg.get("lr", 1e-4),
-                           weight_decay=cfg.get("weight_decay", 0.0))
+    optimizer = optim.Adam(model.parameters(), lr=float(cfg.get("lr", 1e-4)),
+                       weight_decay=float(cfg.get("weight_decay", 0.0)))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.get("epochs", 30), eta_min=1e-6,
     )

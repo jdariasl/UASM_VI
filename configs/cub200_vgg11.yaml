@@ -11,7 +11,7 @@
 
 # --- Model ---
 backbone    : vgg11
-bayesian    : true
+bayesian    : false
 n_classes   : 200
 estimator   : Reparameterization   # or Flipout
 moped_delta : 0.5
@@ -22,18 +22,18 @@ checkpoint  : checkpoints/cub200_vgg11/best_model.pt
 
 # --- Data ---
 dataset     : cub200
-data_root   : data/CUB_200_2011
+data_root   : /media/my_ftp/BasesDeDatos_Imágenes/CUB_200_2011
 
 # --- Training ---
 epochs      : 50
 batch_size  : 32
-lr          : 1e-4
-weight_decay: 1e-4
+lr          : 1.0e-4
+weight_decay: 5.0e-4
 kl_weight   : 1.0
 n_mc_eval   : 5
 
 # --- LRP ---
-lrp_eps     : 1e-6
+lrp_eps     : 1.0e-6
 
 # --- IG ---
 n_samples   : 20

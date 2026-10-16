@@ -33,15 +33,15 @@ data_root   : data/COVIDx
 # --- Training ---
 epochs      : 30
 batch_size  : 16
-lr          : 1e-4
-weight_decay: 1e-5
+lr          : 1.0e-4
+weight_decay: 1.0e-5
 kl_weight   : 1.0
 
 # MC samples for validation/test prediction
 n_mc_eval   : 5
 
 # --- LRP explainability ---
-lrp_eps     : 1e-6
+lrp_eps     : 1.0e-6
 
 # --- IG explainability ---
 n_samples   : 20        # K weight samples

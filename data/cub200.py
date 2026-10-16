@@ -47,6 +47,7 @@ from PIL import Image
 _TRAIN_TRANSFORM = transforms.Compose([
     transforms.RandomResizedCrop(224),
     transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225]),
@@ -129,9 +130,17 @@ class CUB200Dataset(Dataset):
         test_ids  = [i for i in all_ids if id2split[i] == 0]
 
         # 10 % of training → val
-        n_val  = max(1, len(train_ids) // 10)
-        val_ids = train_ids[-n_val:]
-        train_ids = train_ids[:-n_val]
+        by_class = {}
+        for i in train_ids:
+            by_class.setdefault(id2label[i], []).append(i)
+        val_ids, tr_ids = [], []
+        for cls in sorted(by_class):
+            ids = by_class[cls]
+            n_val = max(1, len(ids) // 10)
+            val_ids += ids[-n_val:]
+            tr_ids  += ids[:-n_val]
+        train_ids = sorted(tr_ids)
+        val_ids   = sorted(val_ids)
 
         if self.split == "train":
             selected = train_ids
