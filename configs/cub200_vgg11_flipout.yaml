@@ -1,0 +1,45 @@
+# -----------------------------------------------------------------------
+# Config: CUB-200-2011 fine-grained bird classification  +  Bayesian VGG-11-BN
+#
+# VGG-11 has no residual connections, so LRP-ε relevance propagates
+# strictly layer-by-layer — no skip-connection splitting required.
+# This makes it the cleanest backbone for Bayesian LRP evaluation.
+#
+# Saliency evaluation: pointing game on part annotations
+# Source: http://www.vision.caltech.edu/datasets/cub_200_2011/
+# -----------------------------------------------------------------------
+
+# --- Model ---
+backbone    : vgg11
+bayesian    : true
+n_classes   : 200
+estimator   : Flipout   # or Flipout
+moped_delta : 0.5
+
+saved_model : "checkpoints/cub200_vgg11/best_model.pt"
+
+checkpoint  : checkpoints/cub200_vgg11_flipout/best_model.pt
+
+# --- Data ---
+dataset     : cub200
+data_root   : /media/my_ftp/BasesDeDatos_Imágenes/CUB_200_2011
+
+# --- Training ---
+epochs      : 50
+batch_size  : 32
+lr          : 1.0e-4
+weight_decay: 5.0e-4
+kl_weight   : 1.0
+n_mc_eval   : 5
+
+# --- LRP ---
+lrp_eps     : 1.0e-6
+
+# --- IG ---
+n_samples   : 20
+m_steps     : 50
+baseline    : black
+
+# --- Output ---
+checkpoint_dir : checkpoints/cub200_vgg11_flipout
+num_workers    : 4
