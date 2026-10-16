@@ -95,7 +95,8 @@ def explain_image(
 
     # ---- Compute saliency ----
     if method == "lrp":
-        explainer = BayesianLRP(model, eps=float(cfg.get("lrp_eps", 1e-6)))
+        explainer = BayesianLRP(model, eps=float(cfg.get("lrp_eps", 1e-6)),
+                               eps_std=float(cfg.get("lrp_eps_std", 0.25)))
         mu_R, v_R, snr = explainer.explain(x, target)
         mask = BayesianLRP.uncertainty_mask(v_R, percentile=75.0)
     elif method == "ig":

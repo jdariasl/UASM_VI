@@ -305,6 +305,15 @@ class MomentForwardPass:
 
     # ------------------------------------------------------------------
     def _process_leaf(self, layer, mu, v, e):
+        # torchvision models (VGG, EfficientNet) flatten with the *functional*
+        # torch.flatten between avgpool and the classifier, so it is invisible
+        # to the module walk.  Insert an explicit Flatten record when a Linear
+        # layer receives a spatial tensor.
+        if isinstance(layer, nn.Linear) or is_bayesian_linear(layer):
+            if mu.dim() > 2:
+                mu, v, e = (torch.flatten(t, 1) for t in (mu, v, e))
+                self._record(nn.Flatten(), mu, v, e)
+
         # ---- Bayesian layers ----
         if is_bayesian_conv(layer):
             mu, v, e = _prop_bayesian_conv(mu, v, e, layer)

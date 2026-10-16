@@ -42,6 +42,7 @@ n_mc_eval   : 5
 
 # --- LRP explainability ---
 lrp_eps     : 1.0e-6
+lrp_eps_std : 0.25      # uncertainty-scaled stabiliser; 0 = classical LRP-eps (unstable for BNNs)
 
 # --- IG explainability ---
 n_samples   : 20        # K weight samples

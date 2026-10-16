@@ -129,8 +129,9 @@ class CUB200Dataset(Dataset):
         train_ids = [i for i in all_ids if id2split[i] == 1]
         test_ids  = [i for i in all_ids if id2split[i] == 0]
 
-        # 10 % of training → val
-        by_class = {}
+        # Stratified 10 % of training → val (CUB ids are sorted by class, so a
+        # plain tail slice would put only the last classes in the val set).
+        by_class: Dict[int, List[int]] = {}
         for i in train_ids:
             by_class.setdefault(id2label[i], []).append(i)
         val_ids, tr_ids = [], []

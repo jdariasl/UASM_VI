@@ -59,9 +59,23 @@ def _softplus(rho: torch.Tensor) -> torch.Tensor:
     return F.softplus(rho)
 
 
-def _stabilise(z: torch.Tensor, eps: float) -> torch.Tensor:
-    """hat_z = z + ε·sign(z), avoiding zero denominators."""
-    return z + eps * z.sign().clamp(min=1.0)
+def _stabilise(z: torch.Tensor, eps: float,
+               v_z: Optional[torch.Tensor] = None,
+               eps_std: float = 0.0) -> torch.Tensor:
+    """
+    hat_z = z + sign(z) * (eps + eps_std * sqrt(Var[z])),  sign(0) := +1.
+
+    The classical LRP-eps stabiliser (eps_std = 0) is unreliable for a BNN:
+    pre-activations with mean ~0 and large variance receive relevance through
+    E[ReLU(z)] > 0 and are then divided by a near-zero denominator.  Scaling
+    the stabiliser with the pre-activation's own standard deviation damps
+    exactly those unreliable units.
+    """
+    sign = torch.where(z >= 0, torch.ones_like(z), -torch.ones_like(z))
+    shift = eps
+    if v_z is not None and eps_std > 0.0:
+        shift = eps + eps_std * torch.sqrt(v_z.clamp(min=0.0))
+    return z + sign * shift
 
 
 # ------------------------------------------------- per-layer LRP step -------
@@ -74,6 +88,7 @@ def _lrp_linear_step(
     v_R:    torch.Tensor,   # (B, out)  variance of output neurons
     layer:  nn.Module,
     eps:    float,
+    eps_std: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Bayesian LRP-ε backward step for a Linear layer.
@@ -90,10 +105,11 @@ def _lrp_linear_step(
 
     # ---- Forward moments of pre-activations (needed for hat_z_k) ----
     mu_z  = F.linear(mu_a, mu_w, mu_b)   # (B, out)
-    hat_z = _stabilise(mu_z, eps)         # (B, out)
 
-    # ---- Variance of z_k = Σ_j z_jk  (used in Var[c_jk]) ----
-    sigma_z2 = F.linear(e_a, sigma_w2) + F.linear(v_a, mu_w ** 2)  # (B, out)
+    # ---- Variance of z_k = Σ_j z_jk ----
+    mu_w2    = mu_w ** 2
+    sigma_z2 = F.linear(e_a, sigma_w2) + F.linear(v_a, mu_w2)      # (B, out)
+    hat_z = _stabilise(mu_z, eps, sigma_z2, eps_std)               # (B, out)
 
     # ---- Per-connection moments ----
     # mu_A_{jk}     = mu_a_j * mu_w_{kj}   → shape (B, in, out) – too large
@@ -120,7 +136,7 @@ def _lrp_linear_step(
     #   = Σ_k (mu_a_j * mu_w_kj / hat_z_k)^2 * v_R_k
     #   = mu_a_j^2 * Σ_k (mu_w_kj^2 * v_R_k / hat_z_k^2)
     ratio_var = v_R / (hat_z ** 2)                 # (B, out)
-    t1 = (mu_a ** 2) * F.linear(ratio_var, mu_w ** 2)  # (B, in)
+    t1 = (mu_a ** 2) * F.linear(ratio_var, mu_w2.t())          # (B, in)
 
     # term2 for Var[R_j]:
     #   Σ_k  Var[c_jk] * mu_R_k^2
@@ -130,8 +146,8 @@ def _lrp_linear_step(
     # + v_j * Σ_k [mu²_jk   * mu_R_k^2 / hat_z_k^2]
 
     ratio_mR2 = (mu_R ** 2) / (hat_z ** 2)        # (B, out)
-    t2 = e_a * F.linear(ratio_mR2, sigma_w2) \
-       + v_a * F.linear(ratio_mR2, mu_w ** 2)      # (B, in)
+    t2 = e_a * F.linear(ratio_mR2, sigma_w2.t()) \
+       + v_a * F.linear(ratio_mR2, mu_w2.t())          # (B, in)
 
     v_R_in = (t1 + t2).clamp(min=0.0)
 
@@ -146,6 +162,7 @@ def _lrp_conv_step(
     v_R:   torch.Tensor,
     layer: nn.Module,
     eps:   float,
+    eps_std: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Bayesian LRP-ε backward step for a Conv2d layer.
@@ -167,7 +184,9 @@ def _lrp_conv_step(
 
     # Forward with mean weights to get hat_z
     mu_z  = F.conv2d(mu_a, mu_w, mu_b, **kw)      # (B, C_out, H', W')
-    hat_z = _stabilise(mu_z, eps)
+    sigma_z2 = F.conv2d(e_a, sigma_w2, None, **kw) \
+             + F.conv2d(v_a, mu_w ** 2, None, **kw)
+    hat_z = _stabilise(mu_z, eps, sigma_z2, eps_std)
 
     # ---- E[R_in] via transposed convolution ----
     # ratio_mu_k = mu_R_k / hat_z_k      (B, C_out, H', W')
@@ -206,6 +225,36 @@ def _lrp_conv_step(
     return mu_R_in, v_R_in
 
 
+def _lrp_pool_step(mu_a, mu_R, v_R, layer, eps):
+    """
+    LRP-eps through MaxPool2d / AdaptiveAvgPool2d.
+
+    Relevance of each pooled unit is redistributed to its inputs in proportion
+    to their contribution: for max-pool this is winner-take-all (all relevance
+    goes to the arg-max input), for average pooling it is proportional to a_j/n.
+    The redistribution is obtained with autograd on the (linear-in-routing)
+    pooling operator, so it works for any kernel/stride/padding.
+
+    Variance: the variance of a pooled unit's relevance is routed along the
+    same paths; for average pooling the routing weights enter squared (1/n).
+    """
+    with torch.enable_grad():
+        a = mu_a.detach().clone().requires_grad_(True)
+        z = layer(a)
+        hat_z = _stabilise(z.detach(), eps)
+        c_mu = torch.autograd.grad(z, a, mu_R / hat_z, retain_graph=True)[0]
+        c_v  = torch.autograd.grad(z, a, v_R / hat_z ** 2)[0]
+    mu_R_in = mu_a * c_mu
+    if isinstance(layer, nn.MaxPool2d):
+        v_R_in = (mu_a ** 2) * c_v          # 0/1 routing: weights squared = weights
+    else:
+        h_in, w_in   = mu_a.shape[-2:]
+        h_out, w_out = z.shape[-2:]
+        n = max(1, (h_in // h_out) * (w_in // w_out))
+        v_R_in = (mu_a ** 2) * c_v / n      # (1/n)^2 summed over n units = (1/n) * sum of (1/n)
+    return mu_R_in, v_R_in.clamp(min=0.0)
+
+
 def _lrp_identity_step(mu_R, v_R):
     """Pass-through for BN, activation, pooling, flatten."""
     return mu_R, v_R
@@ -221,6 +270,8 @@ class BayesianLRP:
     ----------
     model  : Bayesian nn.Module (BEfficientNet or BVGG), must be in eval()
     eps    : LRP stabiliser (default 1e-6)
+    eps_std: scale of the uncertainty-dependent stabiliser, hat_z = z + sign(z)(eps + eps_std*std(z));
+             0 recovers classical LRP-eps, ~0.5-1 is recommended for BNNs
 
     Usage
     -----
@@ -233,10 +284,12 @@ class BayesianLRP:
         # snr : (1, C, H, W) signal-to-noise ratio  mu_R / sqrt(v_R)
     """
 
-    def __init__(self, model: nn.Module, eps: float = EPS_DEFAULT):
+    def __init__(self, model: nn.Module, eps: float = EPS_DEFAULT,
+                 eps_std: float = 0.0):
         from explainability.moment_forward import MomentForwardPass
         self.model    = model.eval()
         self.eps      = eps
+        self.eps_std  = eps_std
         self.mp       = MomentForwardPass(model)
 
     # ------------------------------------------------------------------
@@ -281,14 +334,17 @@ class BayesianLRP:
 
             if is_bayesian_linear(layer) or isinstance(layer, nn.Linear):
                 mu_R, v_R = _lrp_linear_step(
-                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps)
+                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps, self.eps_std)
 
             elif is_bayesian_conv(layer) or isinstance(layer, nn.Conv2d):
                 mu_R, v_R = _lrp_conv_step(
-                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps)
+                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps, self.eps_std)
+
+            elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
+                mu_R, v_R = _lrp_pool_step(mu_in, mu_R, v_R, layer, self.eps)
 
             else:
-                # BN, activation, pooling, flatten → identity for relevance
+                # BN, activation, flatten, dropout → identity for relevance
                 mu_R, v_R = _lrp_identity_step(mu_R, v_R)
 
                 # Re-shape if flatten reversed the spatial dims

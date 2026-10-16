@@ -32,6 +32,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from utils.bnn_utils import has_bayesian_layers, has_flipout_layers, SampledTwin
+
 
 # --------------------------------------------------------------------------- #
 #  Path-integral helpers
@@ -116,11 +118,25 @@ class BayesianIG:
         n_samples: int   = 20,
         m_steps:   int   = 50,
         baseline:  str   = "black",
+        use_twin:  Optional[bool] = None,
+        twin:      Optional[SampledTwin] = None,
     ):
+        """
+        use_twin : run IG on explicit weight draws w ~ q (SampledTwin) instead of
+                   calling the BNN directly.  Default (None): True for Flipout,
+                   whose per-example perturbations would otherwise give every
+                   path point a different weight sample and understate Var[IG].
+        twin     : optionally pass an existing SampledTwin to share memory.
+        """
         self.model     = model.eval()
-        self.n_samples = n_samples
+        self.bayesian  = has_bayesian_layers(model)
+        self.n_samples = n_samples if self.bayesian else 1   # deterministic: 1 draw
         self.m_steps   = m_steps
         self.baseline  = baseline
+        if use_twin is None:
+            use_twin = has_flipout_layers(model)
+        self.twin = twin if twin is not None else (
+            SampledTwin(model) if (use_twin and self.bayesian) else None)
 
     # ------------------------------------------------------------------
     def _make_baseline(self, x: torch.Tensor) -> torch.Tensor:
@@ -157,9 +173,12 @@ class BayesianIG:
         samples  = []
 
         for _ in range(self.n_samples):
-            # Each call to the BNN model draws a fresh weight sample
+            # One weight realisation per IG path.  Reparameterization layers
+            # draw a fresh sample per forward call (shared by the whole batch);
+            # with a twin we draw explicitly.
+            net = self.twin.resample() if self.twin is not None else self.model
             ig = _integrated_gradients_single(
-                self.model, x, baseline, target_class, self.m_steps,
+                net, x, baseline, target_class, self.m_steps,
             )
             samples.append(ig)   # (1, C, H, W)
 
@@ -167,7 +186,10 @@ class BayesianIG:
         stacked = torch.stack(samples, dim=0)
 
         mu_ig = stacked.mean(dim=0)                   # (1, C, H, W)
-        v_ig  = stacked.var(dim=0, unbiased=True).clamp(min=0.0)
+        if stacked.shape[0] > 1:
+            v_ig = stacked.var(dim=0, unbiased=True).clamp(min=0.0)
+        else:                                          # deterministic network
+            v_ig = torch.zeros_like(mu_ig)
 
         snr = mu_ig / torch.sqrt(v_ig + 1e-12)
         return mu_ig, v_ig, snr

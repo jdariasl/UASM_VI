@@ -49,7 +49,7 @@ def get_weight_moments(layer):
     if is_bayesian_linear(layer):
         mu_w    = layer.mu_weight                          # (out, in)
         sigma_w = F.softplus(layer.rho_weight)             # (out, in)
-        if layer.bias:
+        if getattr(layer, "mu_bias", None) is not None:
             mu_b    = layer.mu_bias
             sigma_b = F.softplus(layer.rho_bias)
         else:
@@ -58,7 +58,7 @@ def get_weight_moments(layer):
     elif is_bayesian_conv(layer):
         mu_w    = layer.mu_kernel                          # (out, in/g, kH, kW)
         sigma_w = F.softplus(layer.rho_kernel)
-        if layer.bias:
+        if getattr(layer, "mu_bias", None) is not None:
             mu_b    = layer.mu_bias
             sigma_b = F.softplus(layer.rho_bias)
         else:
@@ -87,3 +87,82 @@ def conv_kwargs(layer) -> dict:
         dilation=layer.dilation,
         groups=layer.groups,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic twin with re-drawable weights
+# --------------------------------------------------------------------------- #
+
+def has_bayesian_layers(model) -> bool:
+    return any(is_bayesian(m) for m in model.modules())
+
+
+def has_flipout_layers(model) -> bool:
+    return any("Flipout" in m.__class__.__name__ for m in model.modules())
+
+
+class SampledTwin:
+    """
+    A deterministic copy of a BNN whose weights can be re-drawn in place from
+    the variational posterior  w ~ N(mu, softplus(rho)^2).
+
+    Why it exists
+    -------------
+    * Flipout draws a different perturbation for every example in a batch, so a
+      batched integrated-gradients path would see a different weight sample at
+      every alpha.  A twin holds ONE explicit weight realisation for the whole
+      path, which is what IG for a fixed w requires.
+    * Monte-Carlo estimates of E[R] / Var[R] (to validate the closed-form
+      Bayesian LRP) need explicit deterministic networks.
+
+    Both estimators share the same marginal posterior q(w), so the twin is
+    estimator-agnostic.
+
+        twin = SampledTwin(bnn)
+        twin.resample()           # draw w ~ q
+        logits = twin.net(x)
+    """
+
+    def __init__(self, bnn):
+        import copy
+        import torch.nn as nn
+
+        self.pairs = []                       # (bayesian layer, deterministic layer)
+        memo = {}                             # id(bayesian layer) -> deterministic twin layer
+        for name, old in bnn.named_modules():
+            if not is_bayesian(old):
+                continue
+            if is_bayesian_linear(old):
+                new = nn.Linear(old.in_features, old.out_features, bias=getattr(old, "mu_bias", None) is not None)
+                dev = old.mu_weight.device
+            else:
+                new = nn.Conv2d(old.in_channels, old.out_channels, old.kernel_size,
+                                stride=old.stride, padding=old.padding,
+                                dilation=old.dilation, groups=old.groups,
+                                bias=getattr(old, "mu_bias", None) is not None)
+                dev = old.mu_kernel.device
+            new = new.to(dev)
+            memo[id(old)] = new               # deepcopy will reuse `new` instead of
+            self.pairs.append((old, new))     # copying the (large) Bayesian layer
+        net = copy.deepcopy(bnn, memo)
+        self.net = net.eval()
+        for p in self.net.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def resample(self):
+        for src, dst in self.pairs:
+            mu_w, sigma_w, mu_b, sigma_b = get_weight_moments(src)
+            dst.weight.copy_(mu_w + sigma_w * torch.randn_like(sigma_w))
+            if mu_b is not None:
+                dst.bias.copy_(mu_b + sigma_b * torch.randn_like(sigma_b))
+        return self.net
+
+    @torch.no_grad()
+    def use_mean(self):
+        for src, dst in self.pairs:
+            mu_w, _, mu_b, _ = get_weight_moments(src)
+            dst.weight.copy_(mu_w)
+            if mu_b is not None:
+                dst.bias.copy_(mu_b)
+        return self.net

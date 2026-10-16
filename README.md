@@ -27,6 +27,7 @@ UASM_VI/
 │   ├── chestxray_efficientnet.yaml
 │   └── cub200_vgg11.yaml
 ├── train.py               # ELBO training loop
+├── make_report.py         # figures + metrics for the paper (all checkpoints, 6 examples)
 ├── explain.py             # Single-image explanation entry point
 └── requirements.txt
 ```
@@ -93,6 +94,23 @@ mu_ig, v_ig, snr_ig = big.explain(x, target_class=42)
 ```
 
 ---
+
+## Report figures and metrics
+
+```bash
+python make_report.py --config configs/cub200_vgg11.yaml --ckpt_root checkpoints --outdir results/report
+# optional: aggregate metrics over 100 more test images (no figures)
+python make_report.py --config configs/cub200_vgg11.yaml --n_eval 100
+```
+
+Compares every `checkpoints/cub200_vgg11*` run (deterministic, Reparameterization, Flipout) on six test
+images (4 correct + 2 misclassified by the reference model). Writes one grid figure per image, the raw
+maps (`.npz`), `metrics_examples.csv`, `summary_*.csv` and `summary.md`. Metrics: predictive entropy and
+mutual information, pointing game (with chance rate), LRP conservation, LRP/IG agreement, and a
+Monte-Carlo validation of the closed-form LRP mean and variance.
+
+`lrp_eps_std` (config) scales an uncertainty-dependent LRP stabiliser. Classical LRP-eps (`0`) can diverge
+on BNNs; tune this value on a trained model by watching the conservation column (`lrp_sum_E`).
 
 ## Outputs
 
