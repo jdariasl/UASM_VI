@@ -35,7 +35,7 @@ n_mc_eval   : 5
 # --- LRP ---
 lrp_eps     : 1.0e-6
 lrp_eps_std : 0.25      # uncertainty-scaled stabiliser; 0 = classical LRP-eps (unstable for BNNs)
-
+lrp_fuse_bn : true      # fold BatchNorm into the preceding conv in the LRP backward pass
 # --- IG ---
 n_samples   : 20
 m_steps     : 50

@@ -154,6 +154,25 @@ def _lrp_linear_step(
     return mu_R_in, v_R_in
 
 
+def _convT(x, w, kw, out_hw, groups_override=None):
+    """
+    Transposed convolution that maps back to a given spatial size `out_hw`.
+    For stride > 1 several input sizes produce the same conv output size, so
+    conv_transpose2d needs an explicit output_padding.
+    """
+    stride, pad, dil = kw["stride"], kw["padding"], kw["dilation"]
+    stride = stride if isinstance(stride, tuple) else (stride, stride)
+    pad    = pad    if isinstance(pad, tuple)    else (pad, pad)
+    dil    = dil    if isinstance(dil, tuple)    else (dil, dil)
+    op = []
+    for d in range(2):
+        base = (x.shape[-2 + d] - 1) * stride[d] - 2 * pad[d] + dil[d] * (w.shape[-2 + d] - 1) + 1
+        op.append(int(out_hw[d]) - base)
+    return F.conv_transpose2d(x, w, None, stride=stride, padding=pad,
+                              output_padding=tuple(op), dilation=dil,
+                              groups=kw["groups"])
+
+
 def _lrp_conv_step(
     mu_a:  torch.Tensor,   # (B, C_in, H, W)
     v_a:   torch.Tensor,
@@ -163,12 +182,19 @@ def _lrp_conv_step(
     layer: nn.Module,
     eps:   float,
     eps_std: float = 0.0,
+    bn:    Optional[nn.Module] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Bayesian LRP-ε backward step for a Conv2d layer.
 
     The LRP-ε recurrence for convolutions mirrors the linear case via
     transposed convolution (conv_transpose2d).
+
+    bn : an eval-mode BatchNorm2d that directly follows the convolution.  It is
+         folded into the layer (canonisation): BN(z) = s*z + t is linear, so
+         the fused layer has weights s*W (std s*sigma_W) and bias s*(b-m)+beta.
+         Relevance arriving at the BN output is then redistributed with the
+         correct denominator, which identity treatment of BN does not do.
 
     Returns (mu_R_in, v_R_in) of shape (B, C_in, H, W).
     """
@@ -182,6 +208,13 @@ def _lrp_conv_step(
 
     kw = conv_kwargs(layer)
 
+    if bn is not None:
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)        # (C_out,)
+        b0 = mu_b if mu_b is not None else torch.zeros_like(scale)
+        mu_b     = scale * (b0 - bn.running_mean) + bn.bias
+        mu_w     = mu_w * scale.view(-1, 1, 1, 1)
+        sigma_w2 = sigma_w2 * (scale ** 2).view(-1, 1, 1, 1)
+
     # Forward with mean weights to get hat_z
     mu_z  = F.conv2d(mu_a, mu_w, mu_b, **kw)      # (B, C_out, H', W')
     sigma_z2 = F.conv2d(e_a, sigma_w2, None, **kw) \
@@ -189,36 +222,23 @@ def _lrp_conv_step(
     hat_z = _stabilise(mu_z, eps, sigma_z2, eps_std)
 
     # ---- E[R_in] via transposed convolution ----
-    # ratio_mu_k = mu_R_k / hat_z_k      (B, C_out, H', W')
-    ratio_mu = mu_R / hat_z
+    hw = mu_a.shape[-2:]
+    ratio_mu = mu_R / hat_z                       # (B, C_out, H', W')
 
-    # Σ_k  (mu_w_k * mu_a) / hat_z_k * mu_R_k
-    # = mu_a * conv_T(ratio_mu, mu_w)
-    mu_R_in = mu_a * F.conv_transpose2d(ratio_mu, mu_w, None,
-                                         stride=kw["stride"],
-                                         padding=kw["padding"],
-                                         dilation=kw["dilation"],
-                                         groups=kw["groups"])
+    # Σ_k (mu_w_k * mu_a) / hat_z_k * mu_R_k  =  mu_a * conv_T(ratio_mu, mu_w)
+    mu_R_in = mu_a * _convT(ratio_mu, mu_w, kw, hw)
 
     # ---- Var[R_in] ----
     ratio_var = v_R / (hat_z ** 2)
     ratio_mR2 = (mu_R ** 2) / (hat_z ** 2)
 
     # term1: mu_a^2 * conv_T(v_R / hat_z^2, mu_w^2)
-    t1 = (mu_a ** 2) * F.conv_transpose2d(ratio_var, mu_w ** 2, None,
-                                            stride=kw["stride"],
-                                            padding=kw["padding"],
-                                            dilation=kw["dilation"],
-                                            groups=kw["groups"])
+    mu_w2 = mu_w ** 2
+    t1 = (mu_a ** 2) * _convT(ratio_var, mu_w2, kw, hw)
 
     # term2: e_a * conv_T(mu_R^2/hat_z^2, sigma²_w) + v_a * conv_T(..., mu²_w)
-    t2_e = F.conv_transpose2d(ratio_mR2, sigma_w2, None,
-                               stride=kw["stride"], padding=kw["padding"],
-                               dilation=kw["dilation"], groups=kw["groups"])
-    t2_v = F.conv_transpose2d(ratio_mR2, mu_w ** 2, None,
-                               stride=kw["stride"], padding=kw["padding"],
-                               dilation=kw["dilation"], groups=kw["groups"])
-    t2 = e_a * t2_e + v_a * t2_v
+    t2 = e_a * _convT(ratio_mR2, sigma_w2, kw, hw) \
+       + v_a * _convT(ratio_mR2, mu_w2, kw, hw)
 
     v_R_in = (t1 + t2).clamp(min=0.0)
 
@@ -272,6 +292,15 @@ class BayesianLRP:
     eps    : LRP stabiliser (default 1e-6)
     eps_std: scale of the uncertainty-dependent stabiliser, hat_z = z + sign(z)(eps + eps_std*std(z));
              0 recovers classical LRP-eps, ~0.5-1 is recommended for BNNs
+    fuse_bn: fold every eval-mode BatchNorm into the convolution before it in the
+             backward pass (standard LRP canonisation; strongly recommended for
+             ResNets).  False treats BN as identity for relevance.
+
+    Supported networks: sequential CNNs (VGG) and torchvision ResNets
+    (BasicBlock / Bottleneck).  At every residual add the relevance is split
+    between the two branches with the delta-method moments of the contribution
+    ratios, and the two relevance streams are summed at the block input,
+    treating the branches as independent (means and variances add).
 
     Usage
     -----
@@ -285,12 +314,15 @@ class BayesianLRP:
     """
 
     def __init__(self, model: nn.Module, eps: float = EPS_DEFAULT,
-                 eps_std: float = 0.0):
+                 eps_std: float = 0.0, fuse_bn: bool = True):
         from explainability.moment_forward import MomentForwardPass
         self.model    = model.eval()
         self.eps      = eps
         self.eps_std  = eps_std
+        self.fuse_bn  = fuse_bn
         self.mp       = MomentForwardPass(model)
+        self.last_stats = None          # forward moments of the last explain() call
+        self.last_sign  = 1.0           # sign of the explained logit (start relevance)
 
     # ------------------------------------------------------------------
     def explain(self, x: torch.Tensor, target_class: int):
@@ -315,45 +347,117 @@ class BayesianLRP:
         last = stats[-1]
         mu_R_out = torch.zeros_like(last["mu"])
         v_R_out  = torch.zeros_like(last["v"])
-        mu_R_out[0, target_class] = 1.0
+        # Start with relevance sign(mean logit) on the target logit.  Then
+        # R_j = z_jT / |z_T|, i.e. positive relevance always means "pushes this
+        # logit up", whatever the sign of the logit (a +1 start would flip every
+        # map when the logit is negative, e.g. when explaining a non-predicted
+        # class).  Variance terms depend on mu_R^2 and are unaffected.
+        self.last_sign = 1.0 if float(last["mu"][0, target_class]) >= 0 else -1.0
+        mu_R_out[0, target_class] = self.last_sign
 
         mu_R = mu_R_out
         v_R  = v_R_out
 
-        # --- Walk backward ---
-        # We pair each stat with the one before it (the layer's input).
-        # stats[0] is the raw input; stats[i] is the output of layer[i].
-        for i in range(len(stats) - 1, 0, -1):
-            layer  = stats[i]["layer"]
-            mu_in  = stats[i - 1]["mu"]
-            v_in   = stats[i - 1]["v"]
-            e_in   = stats[i - 1]["e"]
-
-            if layer is None:
-                continue
-
-            if is_bayesian_linear(layer) or isinstance(layer, nn.Linear):
-                mu_R, v_R = _lrp_linear_step(
-                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps, self.eps_std)
-
-            elif is_bayesian_conv(layer) or isinstance(layer, nn.Conv2d):
-                mu_R, v_R = _lrp_conv_step(
-                    mu_in, v_in, e_in, mu_R, v_R, layer, self.eps, self.eps_std)
-
-            elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
-                mu_R, v_R = _lrp_pool_step(mu_in, mu_R, v_R, layer, self.eps)
-
-            else:
-                # BN, activation, flatten, dropout → identity for relevance
-                mu_R, v_R = _lrp_identity_step(mu_R, v_R)
-
-                # Re-shape if flatten reversed the spatial dims
-                if isinstance(layer, nn.Flatten) and mu_in.dim() > mu_R.dim():
-                    mu_R = mu_R.reshape(mu_in.shape)
-                    v_R  = v_R.reshape(mu_in.shape)
+        # --- Walk backward (recursive: residual blocks contain sub-sequences) ---
+        self.last_stats = stats
+        mu_R, v_R = self._backward(stats[1:], stats[0], mu_R, v_R)
 
         snr = mu_R / torch.sqrt(v_R + 1e-12)
         return mu_R, v_R, snr
+
+    # ------------------------------------------------------------------
+    def _backward(self, records, inp, mu_R, v_R):
+        """
+        Propagate relevance backward through a forward-ordered list of records.
+
+        records : list of stat dicts as produced by MomentForwardPass
+        inp     : stat dict of the tensor entering records[0]
+        """
+        eps, eps_std = self.eps, self.eps_std
+        i = len(records) - 1
+        while i >= 0:
+            rec   = records[i]
+            layer = rec["layer"]
+            prev  = records[i - 1] if i > 0 else inp
+
+            # ---- residual block ----
+            if rec.get("kind") == "residual":
+                mu_R, v_R = self._backward_residual(rec, prev, mu_R, v_R)
+                i -= 1
+                continue
+
+            # ---- conv followed by BN: fuse (the BN record is the one we are at) ----
+            if (self.fuse_bn and isinstance(layer, nn.BatchNorm2d) and i > 0
+                    and records[i - 1].get("kind") != "residual"
+                    and (is_bayesian_conv(records[i - 1]["layer"])
+                         or isinstance(records[i - 1]["layer"], nn.Conv2d))):
+                conv  = records[i - 1]["layer"]
+                prev2 = records[i - 2] if i > 1 else inp
+                mu_R, v_R = _lrp_conv_step(prev2["mu"], prev2["v"], prev2["e"],
+                                           mu_R, v_R, conv, eps, eps_std, bn=layer)
+                i -= 2
+                continue
+
+            mu_in, v_in, e_in = prev["mu"], prev["v"], prev["e"]
+
+            if is_bayesian_linear(layer) or isinstance(layer, nn.Linear):
+                mu_R, v_R = _lrp_linear_step(mu_in, v_in, e_in, mu_R, v_R, layer, eps, eps_std)
+
+            elif is_bayesian_conv(layer) or isinstance(layer, nn.Conv2d):
+                mu_R, v_R = _lrp_conv_step(mu_in, v_in, e_in, mu_R, v_R, layer, eps, eps_std)
+
+            elif isinstance(layer, (nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
+                mu_R, v_R = _lrp_pool_step(mu_in, mu_R, v_R, layer, eps)
+
+            else:
+                # BN (when not fused), activation, flatten, dropout → identity
+                mu_R, v_R = _lrp_identity_step(mu_R, v_R)
+                if isinstance(layer, nn.Flatten) and mu_in.dim() > mu_R.dim():
+                    mu_R = mu_R.reshape(mu_in.shape)
+                    v_R  = v_R.reshape(mu_in.shape)
+            i -= 1
+        return mu_R, v_R
+
+    # ------------------------------------------------------------------
+    def _backward_residual(self, rec, x_stats, mu_R, v_R):
+        """
+        Relevance through  y = ReLU(a + b),  a = F(x) (body), b = S(x) (shortcut).
+
+        1. The final ReLU is identity for relevance.
+        2. Split at the add with LRP-eps contributions  c_a = a/hat_s,
+           c_b = b/hat_s,  hat_s = (a+b) + sign*(eps + eps_std*std).  With a, b
+           independent, the delta method gives
+
+               E[c_a] = mu_a / hat_s,        E[c_b] = mu_b / hat_s,
+               Var[c_a] = Var[c_b] = (mu_b^2 v_a + mu_a^2 v_b) / hat_s^4
+
+           (c_a + c_b = 1, so both ratios have the same variance), and
+
+               E[R_a]   = E[c_a] E[R],
+               Var[R_a] = E[c_a]^2 Var[R] + Var[c_a] (Var[R] + E[R]^2)   (same for b).
+        3. Each stream goes backward through its own sub-sequence.
+        4. The streams meet again at the block input and are summed, treating
+           them as independent:  means and variances add.
+        """
+        a, va = rec["main"]["mu"], rec["main"]["v"]
+        b, vb = rec["sc"]["mu"],   rec["sc"]["v"]
+
+        hat   = _stabilise(a + b, self.eps, va + vb, self.eps_std)
+        c_a   = a / hat
+        c_b   = b / hat
+        var_c = (b ** 2 * va + a ** 2 * vb) / hat ** 4
+
+        # Var[cR] = Var[c](V + M^2) + E[c]^2 V   (independent c and R; paper Eq. eps_R_var)
+        mu_Ra, v_Ra = c_a * mu_R, c_a ** 2 * v_R + var_c * (v_R + mu_R ** 2)
+        mu_Rb, v_Rb = c_b * mu_R, c_b ** 2 * v_R + var_c * (v_R + mu_R ** 2)
+
+        mu_a_in, v_a_in = self._backward(rec["body"], x_stats, mu_Ra, v_Ra)
+        if rec["short"]:
+            mu_b_in, v_b_in = self._backward(rec["short"], x_stats, mu_Rb, v_Rb)
+        else:                                   # identity shortcut
+            mu_b_in, v_b_in = mu_Rb, v_Rb
+
+        return mu_a_in + mu_b_in, v_a_in + v_b_in
 
     # ------------------------------------------------------------------
     @staticmethod

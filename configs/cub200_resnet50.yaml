@@ -1,0 +1,48 @@
+# -----------------------------------------------------------------------
+# Config: CUB-200-2011 fine-grained bird classification  +  Bayesian ResNet-50
+#
+# Residual connections are handled by the closed-form Bayesian LRP: relevance is
+# split at every add (delta-method moments of the contribution ratios) and the
+# two streams are merged at the block input; the two branches are treated as
+# independent.  BatchNorm is folded into the preceding convolution.
+#
+# Saliency evaluation: pointing game on part annotations
+# Source: http://www.vision.caltech.edu/datasets/cub_200_2011/
+# -----------------------------------------------------------------------
+
+# --- Model ---
+backbone    : resnet50
+bayesian    : true
+n_classes   : 200
+estimator   : Reparameterization   # or Flipout
+moped_delta : 0.5
+
+saved_model : ""
+
+checkpoint  : checkpoints/cub200_resnet50/best_model.pt
+
+# --- Data ---
+dataset     : cub200
+data_root   : data/CUB_200_2011
+
+# --- Training ---
+epochs      : 50
+batch_size  : 32
+lr          : 1.0e-4
+weight_decay: 1.0e-4
+kl_weight   : 1.0
+n_mc_eval   : 5
+
+# --- LRP ---
+lrp_eps     : 1.0e-6
+lrp_eps_std : 0.1       # tune with tune_eps_std.py: too small -> relevance explodes, too large -> it leaks away
+lrp_fuse_bn : true      # fold BatchNorm into the preceding conv in the LRP backward pass
+
+# --- IG ---
+n_samples   : 20
+m_steps     : 50
+baseline    : black
+
+# --- Output ---
+checkpoint_dir : checkpoints/cub200_resnet50
+num_workers    : 4

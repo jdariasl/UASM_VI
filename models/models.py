@@ -12,6 +12,8 @@ Estimator can be switched via the `estimator` argument:
   "Flipout"
 """
 
+import functools
+
 import torch
 import torch.nn as nn
 import torchvision
@@ -82,12 +84,12 @@ def BEfficientNet(n_classes: int = 3,
 # VGG-11
 # --------------------------------------------------------------------------- #
 
-def VGG(n_classes: int = 3) -> nn.Module:
+def VGG(n_classes: int = 3, arch: str = "vgg11_bn") -> nn.Module:
     """
-    Deterministic VGG-11 with batch normalisation.
+    Deterministic VGG-BN (vgg11_bn | vgg13_bn | vgg16_bn | vgg19_bn).
     The classifier head is replaced to match n_classes.
     """
-    model = torchvision.models.vgg11_bn(weights="DEFAULT")
+    model = getattr(torchvision.models, arch)(weights="DEFAULT")
     model.classifier[6] = nn.Linear(4096, n_classes)
     return model
 
@@ -95,9 +97,10 @@ def VGG(n_classes: int = 3) -> nn.Module:
 def BVGG(n_classes: int = 3,
          saved_model: str = "",
          estimator: str = "Reparameterization",
-         moped_delta: float = 0.5) -> nn.Module:
+         moped_delta: float = 0.5,
+         arch: str = "vgg11_bn") -> nn.Module:
     """
-    Bayesian VGG-11-BN.
+    Bayesian VGG-BN (default VGG-11).
 
     VGG-11 has no residual connections, making it the cleanest architecture
     for Bayesian LRP-ε: relevance propagates strictly layer-by-layer without
@@ -106,7 +109,37 @@ def BVGG(n_classes: int = 3,
     saved_model : optional deterministic checkpoint for MOPED warm-start.
     estimator   : "Reparameterization" | "Flipout"
     """
-    model = VGG(n_classes=n_classes)
+    model = VGG(n_classes=n_classes, arch=arch)
+    if saved_model:
+        checkpoint = torch.load(saved_model, map_location="cpu")
+        state = checkpoint.get("state_dict", checkpoint)
+        model.load_state_dict(state)
+    dnn_to_bnn(model, bnn_prior_parameters(estimator, moped_delta))
+    return model
+
+
+# --------------------------------------------------------------------------- #
+# ResNet family (BasicBlock: 18/34, Bottleneck: 50/101/152)
+# --------------------------------------------------------------------------- #
+
+def ResNet(n_classes: int = 3, arch: str = "resnet50") -> nn.Module:
+    """Deterministic torchvision ResNet with the fc head replaced."""
+    model = getattr(torchvision.models, arch)(weights="DEFAULT")
+    model.fc = nn.Linear(model.fc.in_features, n_classes)
+    return model
+
+
+def BResNet(n_classes: int = 3,
+            saved_model: str = "",
+            estimator: str = "Reparameterization",
+            moped_delta: float = 0.5,
+            arch: str = "resnet50") -> nn.Module:
+    """
+    Bayesian ResNet.  Residual connections are supported by the closed-form
+    Bayesian LRP (see explainability/bayesian_lrp.py): relevance is split at every
+    add and the two streams are merged at the block input.
+    """
+    model = ResNet(n_classes=n_classes, arch=arch)
     if saved_model:
         checkpoint = torch.load(saved_model, map_location="cpu")
         state = checkpoint.get("state_dict", checkpoint)
@@ -122,6 +155,12 @@ def BVGG(n_classes: int = 3,
 BACKBONE_REGISTRY = {
     "efficientnet_b6":   (EfficientNet, BEfficientNet),
     "vgg11":             (VGG,          BVGG),
+    "vgg16":             (functools.partial(VGG, arch="vgg16_bn"),
+                          functools.partial(BVGG, arch="vgg16_bn")),
+    "vgg19":             (functools.partial(VGG, arch="vgg19_bn"),
+                          functools.partial(BVGG, arch="vgg19_bn")),
+    **{a: (functools.partial(ResNet, arch=a), functools.partial(BResNet, arch=a))
+       for a in ("resnet18", "resnet34", "resnet50", "resnet101")},
 }
 
 
@@ -134,7 +173,7 @@ def select_model(backbone: str,
     """
     Unified model factory.
 
-    backbone    : "efficientnet_b6" | "vgg11"
+    backbone    : "efficientnet_b6" | "vgg11" | "vgg16" | "vgg19" | "resnet18/34/50/101"
     bayesian    : True for BNN, False for deterministic baseline
     n_classes   : number of output classes
     saved_model : path to a pretrained checkpoint (for MOPED warm-start)

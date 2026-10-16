@@ -32,6 +32,7 @@ Usage
 from __future__ import annotations
 
 import math
+import warnings
 from typing import List, Dict
 
 import torch
@@ -42,6 +43,33 @@ from utils.bnn_utils import (
     is_bayesian, is_bayesian_conv, is_bayesian_linear,
     get_weight_moments, conv_kwargs,
 )
+
+# --------------------------------------------------- supported containers ----
+try:
+    from torchvision.models.resnet import BasicBlock, Bottleneck, ResNet
+    from torchvision.models.vgg import VGG as _TVVGG
+    _RESIDUAL_BLOCKS = (BasicBlock, Bottleneck)
+    # containers whose children are stored in forward order, so a plain
+    # depth-first walk reproduces the data flow
+    _SEQUENTIAL_CONTAINERS = (nn.Sequential, ResNet, _TVVGG)
+except ImportError:                                  # torchvision not installed
+    _RESIDUAL_BLOCKS = ()
+    _SEQUENTIAL_CONTAINERS = (nn.Sequential,)
+
+_WARNED = set()
+
+
+def _warn_unsupported(module: nn.Module):
+    """Modules with children that we cannot walk in data-flow order."""
+    name = type(module).__name__
+    if name not in _WARNED:
+        _WARNED.add(name)
+        warnings.warn(
+            f"MomentForwardPass: '{name}' is not a known sequential container or "
+            "residual block. Its children are walked in definition order, which "
+            "may not match its forward(); results for this network are unreliable.",
+            stacklevel=3)
+
 
 # ------------------------------------------------------------------ helpers --
 
@@ -298,10 +326,69 @@ class MomentForwardPass:
             mu, v, e = self._process_leaf(module, mu, v, e)
             return mu, v, e
 
+        if isinstance(module, _RESIDUAL_BLOCKS):
+            return self._process_residual(module, mu, v, e)
+
+        if module is not self.model and not isinstance(module, _SEQUENTIAL_CONTAINERS):
+            _warn_unsupported(module)
+
         for _, child in children:
             mu, v, e = self._walk(child, mu, v, e)
 
         return mu, v, e
+
+    # ------------------------------------------------------------------
+    def _process_residual(self, block, mu, v, e):
+        """
+        torchvision BasicBlock / Bottleneck:   y = ReLU( F(x) + S(x) )
+
+        F is the conv-BN(-ReLU) body, S the identity or the 1x1 projection
+        (downsample).  Both are propagated from the SAME input moments.  The
+        two branch outputs are then summed assuming they are independent, so
+        means AND variances add:
+
+            mu_y = mu_F + mu_S,        v_y = v_F + v_S .
+
+        (The branches share the input x and its upstream weights, so this
+        ignores Cov[F(x), S(x)]; make_report quantifies the resulting error
+        against Monte-Carlo.)  The block is stored as ONE record that keeps its
+        sub-records, because the backward pass must split relevance at the add.
+        """
+        if isinstance(block, BasicBlock):
+            body_mods = [block.conv1, block.bn1, block.relu, block.conv2, block.bn2]
+        else:  # Bottleneck
+            body_mods = [block.conv1, block.bn1, block.relu, block.conv2, block.bn2,
+                         block.relu, block.conv3, block.bn3]
+
+        outer = self.layer_stats
+
+        self.layer_stats = []
+        mb, vb, eb = mu, v, e
+        for m in body_mods:
+            mb, vb, eb = self._walk(m, mb, vb, eb)
+        body = self.layer_stats
+
+        self.layer_stats = []
+        ms, vs, es = mu, v, e
+        if block.downsample is not None:
+            for m in block.downsample:
+                ms, vs, es = self._walk(m, ms, vs, es)
+        short = self.layer_stats                      # empty list = identity shortcut
+
+        self.layer_stats = outer
+
+        mu_s = mb + ms
+        v_s  = vb + vs
+        mu_o, v_o, e_o = _relu_moments(mu_s, v_s)     # block output = ReLU(sum)
+
+        d = lambda a, b, c: {"mu": a.detach(), "v": b.detach(), "e": c.detach()}
+        outer.append({
+            "layer": block, "kind": "residual",
+            "mu": mu_o.detach(), "v": v_o.detach(), "e": e_o.detach(),
+            "body": body, "short": short,
+            "main": d(mb, vb, eb), "sc": d(ms, vs, es),
+        })
+        return mu_o, v_o, e_o
 
     # ------------------------------------------------------------------
     def _process_leaf(self, layer, mu, v, e):

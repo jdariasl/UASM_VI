@@ -25,8 +25,13 @@ Localisation : pointing game on the CUB part annotations (peak of the map falls
 Faithfulness : LRP conservation  sum_i E[R_i]  (equals the unit relevance placed
                on the target logit, up to bias/BN/stabiliser leakage).
 Agreement    : Spearman correlation between the LRP and IG maps.
-Validation   : (BNNs) closed-form E[R], Var[R] versus Monte-Carlo LRP on explicit
-               weight draws w ~ q:  Pearson(E), Spearman(Var), Var ratio.
+Validation   : (BNNs) closed-form moments versus references that do not share its
+               approximations.  logit_var_ratio_fo = analytic Var[logit] / first-order
+               weight-space delta method (sampling-free, exact for small noise);
+               mc_logit_var_ratio = analytic / Monte-Carlo over weight draws;
+               mc_pearson_E / mc_spearman_Var / mc_var_ratio compare the LRP maps
+               with Monte-Carlo LRP on explicit w ~ q.  A ratio near 1 is good; for
+               residual networks expect < 1 (branches are treated as independent).
 
 Usage
 -----
@@ -118,7 +123,7 @@ def load_entries(cfg: dict, ckpt_root: Path, device, args) -> List[Entry]:
         if e.bayesian:
             e.twin = SampledTwin(e.model)
         e.lrp = BayesianLRP(e.model, eps=float(cfg.get("lrp_eps", 1e-6)),
-                            eps_std=args.eps_std)
+                            eps_std=args.eps_std, fuse_bn=bool(cfg.get("lrp_fuse_bn", True)))
         e.ig = BayesianIG(e.model, n_samples=int(cfg.get("n_samples", 20)),
                           m_steps=int(cfg.get("m_steps", 50)),
                           baseline=cfg.get("baseline", "black"),
@@ -222,32 +227,65 @@ def explain_one(e: Entry, x: torch.Tensor, target: int, seed: int):
     out = {}
     mu, v, snr = e.lrp.explain(x, target)
     out["lrp"] = (mu.detach(), v.detach(), snr.detach() if e.bayesian else None)
+    last = e.lrp.last_stats[-1]
+    out["logit"] = (float(last["mu"][0, target]), float(last["v"][0, target]))
+    out["sign"] = e.lrp.last_sign
     mu, v, snr = e.ig.explain(x, target)
     out["ig"] = (mu.detach(), v.detach(), snr.detach() if e.bayesian else None)
     return out
 
 
+def first_order_logit_var(e: Entry, x: torch.Tensor, target: int) -> float:
+    """
+    Sampling-free reference for Var[logit]: first-order weight-space delta method
+        Var[f] ~= sum_w (df/dw)^2 sigma_w^2,   gradient taken at the mean weights.
+    Exact in the small-noise limit and free of any independence assumption, so
+    it isolates the error of the closed-form moment propagation.
+    """
+    from utils.bnn_utils import get_weight_moments
+    e.twin.use_mean()
+    for p in e.twin.net.parameters():
+        p.requires_grad_(True)
+    e.twin.net.zero_grad(set_to_none=True)
+    e.twin.net(x)[0, target].backward()
+    var = 0.0
+    for src, dst in e.twin.pairs:
+        _, sw, _, sb = get_weight_moments(src)
+        var += float((dst.weight.grad ** 2 * sw ** 2).sum())
+        if dst.bias is not None and dst.bias.grad is not None:
+            var += float((dst.bias.grad ** 2 * sb ** 2).sum())
+    for p in e.twin.net.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+    return var
+
+
 def mc_lrp_validation(e: Entry, xs: List[torch.Tensor], targets: List[int],
-                      analytic: List[Tuple[torch.Tensor, torch.Tensor]],
+                      analytic: List[Tuple[torch.Tensor, torch.Tensor, float, float]],
                       n_mc: int, eps: float, seed: int) -> List[dict]:
-    """Closed-form (E[R], Var[R]) versus Monte-Carlo LRP on explicit w ~ q."""
+    """Closed-form (E[R], Var[R], logit moments) versus Monte-Carlo on explicit w ~ q."""
     torch.manual_seed(seed)
     runner = BayesianLRP(e.twin.net, eps=eps, eps_std=0.0)   # deterministic net
     acc = [[] for _ in xs]
+    lg = [[] for _ in xs]
     for _ in range(n_mc):
         e.twin.resample()
         for i, (x, t) in enumerate(zip(xs, targets)):
+            with torch.no_grad():
+                lg[i].append(float(e.twin.net(x)[0, t]))
             mu, _, _ = runner.explain(x, t)
             acc[i].append(mu.detach().cpu())
     res = []
-    for i, (mu_a, v_a) in enumerate(analytic):
+    for i, (mu_a, v_a, lmu, lvar) in enumerate(analytic):
         st = torch.stack(acc[i])                              # (K,1,C,H,W)
         mu_mc, v_mc = st.mean(0), st.var(0, unbiased=True)
         mu_a, v_a = mu_a.cpu(), v_a.cpu()
+        lv_mc = float(np.var(lg[i], ddof=1))
         res.append(dict(
             mc_pearson_E=pearson(mu_a.numpy(), mu_mc.numpy()),
             mc_spearman_Var=spearman(v_a.numpy(), v_mc.numpy()),
             mc_var_ratio=float(v_a.sum() / v_mc.sum().clamp(min=1e-30)),
+            mc_logit_var_ratio=lvar / max(lv_mc, 1e-30),
         ))
     return res
 
@@ -267,7 +305,8 @@ def image_metrics(pred: dict, maps: dict, mask: np.ndarray, hit_base: float,
         row[f"{name}_hit_E"] = peak_hit(e_map, mask)
         row[f"{name}_hit_SNR"] = peak_hit(chan_mean(snr), mask) if snr is not None else float("nan")
         row[f"{name}_mean_var"] = float(v.mean()) if bayesian else float("nan")
-        row[f"{name}_sum_E"] = float(mu.sum())
+        # LRP starts at sign(logit): multiply back so conservation reads ~1
+        row[f"{name}_sum_E"] = float(mu.sum()) * (maps["sign"] if name == "lrp" else 1.0)
     row["lrp_ig_spearman"] = spearman(chan_sum(maps["lrp"][0]), chan_sum(maps["ig"][0]))
     return row
 
@@ -329,7 +368,8 @@ def example_figure(path: Path, img: np.ndarray, pts: np.ndarray, title: str,
 METRIC_COLS = ["pred", "correct", "conf", "entropy", "mutual_info",
                "lrp_sum_E", "lrp_mean_var", "lrp_hit_E", "lrp_hit_SNR",
                "ig_mean_var", "ig_hit_E", "ig_hit_SNR", "chance_hit",
-               "lrp_ig_spearman", "mc_pearson_E", "mc_spearman_Var", "mc_var_ratio"]
+               "lrp_ig_spearman", "logit_var_ratio_fo", "mc_logit_var_ratio",
+               "mc_pearson_E", "mc_spearman_Var", "mc_var_ratio"]
 
 
 def _fmt(v):
@@ -402,7 +442,8 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     if args.eps_std is None:
         args.eps_std = float(cfg.get("lrp_eps_std", 0.25))
-    assert cfg["backbone"] == "vgg11", "make_report currently supports the VGG-11 closed-form LRP only"
+    assert cfg["backbone"] in ("vgg11", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "resnet101"), \
+        "make_report supports VGG and ResNet (closed-form LRP needs sequential or residual-block networks)"
     device = torch.device(args.device)
     out = Path(args.outdir); (out / "figures").mkdir(parents=True, exist_ok=True)
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -469,6 +510,9 @@ def main():
             m = image_metrics(pr, mp, mask, base, e.bayesian, y)
             m.update(image=idx, tag=("example" if is_example else "eval"),
                      model=e.label, true=y, target=target)
+            if e.bayesian:
+                m["logit_var"] = mp["logit"][1]
+                m["logit_var_ratio_fo"] = mp["logit"][1] / max(first_order_logit_var(e, x, target), 1e-30)
             rows.append(m)
             per_model[e.label] = mp
             sub = f"pred: {cname(pr['pred'])[:18]}\np={pr['conf']:.2f}"
@@ -501,8 +545,8 @@ def main():
             if not e.bayesian:
                 continue
             print(f"MC validation of closed-form LRP: {e.label} ({args.n_mc_lrp} draws)")
-            an = [(maps_store[idx][e.label]["lrp"][0], maps_store[idx][e.label]["lrp"][1])
-                  for idx in chosen]
+            an = [(maps_store[idx][e.label]["lrp"][0], maps_store[idx][e.label]["lrp"][1],
+                   *maps_store[idx][e.label]["logit"]) for idx in chosen]
             res = mc_lrp_validation(e, xs, ts, an, args.n_mc_lrp,
                                     float(cfg.get("lrp_eps", 1e-6)), args.seed)
             for idx, r in zip(chosen, res):
@@ -526,7 +570,8 @@ def main():
           f"MC-LRP draws={args.n_mc_lrp}.\n",
           "`*_hit_*`: 1 = peak of the map within tolerance of a visible part. `chance_hit` is the "
           "fraction of pixels within tolerance (expected hit rate of a random peak). "
-          "`lrp_sum_E` is the conservation check. `mc_*`: closed-form LRP vs Monte-Carlo.\n"]
+          "`lrp_sum_E` is the conservation check. `logit_var_ratio_fo` / `mc_logit_var_ratio`: analytic "
+          "Var[logit] divided by the first-order / Monte-Carlo reference (1 = exact). `mc_*`: LRP maps vs Monte-Carlo.\n"]
     for title, rs in summaries:
         agg = aggregate(rs, labels)
         write_csv(out / f"summary_{'examples' if title == 'Examples' else 'eval'}.csv", agg,

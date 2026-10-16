@@ -12,7 +12,7 @@ for VI-BNNs, generating saliency maps with per-pixel uncertainty quantification.
 ```
 UASM_VI/
 ├── models/
-│   └── models.py          # BEfficientNet-B6, BVGG-11-BN, factory select_model()
+│   └── models.py          # BEfficientNet-B6, BVGG-11/16/19, BResNet-18/34/50/101, select_model()
 ├── explainability/
 │   ├── moment_forward.py  # Forward moment propagation (μ, v, e) through BNN
 │   ├── bayesian_lrp.py    # Bayesian LRP-ε  → E[R], Var[R], SNR
@@ -25,7 +25,10 @@ UASM_VI/
 │   └── visualization.py   # Saliency / SNR / mask figure generation
 ├── configs/
 │   ├── chestxray_efficientnet.yaml
-│   └── cub200_vgg11.yaml
+│   ├── cub200_vgg11.yaml
+│   ├── cub200_vgg16.yaml
+│   └── cub200_resnet50.yaml
+├── tune_eps_std.py        # sweep lrp_eps_std on a checkpoint (conservation check)
 ├── train.py               # ELBO training loop
 ├── make_report.py         # figures + metrics for the paper (all checkpoints, 6 examples)
 ├── explain.py             # Single-image explanation entry point
@@ -128,10 +131,32 @@ Each call to `explain.py` writes three images to `--outdir`:
 
 | Model | Architecture | Notes |
 |-------|-------------|-------|
-| `vgg11` | VGG-11-BN | **Preferred for Bayesian LRP**: no skip connections |
-| `efficientnet_b6` | EfficientNet-B6 | Higher accuracy; MBConv skip connections handled via identity pass |
+| `vgg11/16/19` | VGG-BN | No skip connections: cleanest case for Bayesian LRP |
+| `resnet18/34/50/101` | ResNet | Residual blocks handled by a block-aware walker (see below) |
+| `efficientnet_b6` | EfficientNet-B6 | MBConv/SE blocks **not yet supported** by the moment walker (future work) |
 
-Both support `estimator: Reparameterization` (default) and `estimator: Flipout`.
+All support `estimator: Reparameterization` (default) and `estimator: Flipout`.
+
+### Residual connections
+
+At each `y = ReLU(F(x) + S(x))` the two branches are treated as **independent**: forward
+variances add, and relevance is split with the delta-method moments of the add node, then
+merged (means and variances added) at the block input. BatchNorm is folded into the preceding
+conv in the LRP backward pass (`lrp_fuse_bn: true`; set `false` to reproduce the unfolded behaviour).
+
+**Caveat.** Dropping Cov(F,S) *underestimates* the variance in residual nets. On random-weight
+tests with small posterior noise the closed-form logit variance was ~1.0x the first-order
+weight-space reference for VGG-11 but ~0.3x for ResNet-18/50. `make_report.py` reports
+`logit_var_ratio_fo` (first-order reference; only trustworthy for small noise) and
+`mc_*` columns (Monte-Carlo, use these at large noise, e.g. MOPED delta 0.5) so you can
+quantify the gap on your trained models. Relevance seed is sign(logit); SNR is scale-invariant.
+
+### Tuning `lrp_eps_std`
+
+```bash
+python tune_eps_std.py --config configs/cub200_resnet50.yaml --checkpoint checkpoints/cub200_resnet50/best_model.pt
+```
+Pick the smallest value for which the conservation sum (`lrp_sum_E`) stays near 1 without exploding.
 
 ---
 
