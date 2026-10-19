@@ -64,8 +64,19 @@ def train_one_epoch(
     device:     torch.device,
     kl_weight:  float,
     n_train:    int,
+    amp:        bool = False,
+    freeze_bn:  bool = False,
 ) -> dict:
     model.train()
+    if freeze_bn:
+        # Keep BatchNorm in inference mode (running stats from the deterministic
+        # model, no batch statistics).  Needed for VI-BNNs: with one weight draw
+        # per batch, train-mode BN silently cancels the draw-specific shift, so
+        # the net looks fine in training and collapses at evaluation.
+        for m in model.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
     total_loss = total_ce = total_kl = correct = n = 0
 
     for batch in loader:
@@ -75,17 +86,22 @@ def train_one_epoch(
         else:
             imgs, labels = batch
 
-        imgs   = imgs.to(device)
-        labels = labels.to(device)
+        imgs   = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if amp:
+            imgs = imgs.contiguous(memory_format=torch.channels_last)
 
-        optimizer.zero_grad()
-        logits = model(imgs)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            logits = model(imgs)
+        logits = logits.float()
         ce  = criterion(logits, labels)
         kl  = get_kl_loss(model) / n_train
         loss = ce + kl_weight * kl
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         bs = imgs.size(0)
         total_loss += loss.item() * bs
@@ -167,6 +183,13 @@ def main(cfg: dict):
         moped_delta = cfg.get("moped_delta", 0.5),
     ).to(device)
 
+    # Mixed precision: only for deterministic nets (Bayesian layers stay fp32).
+    amp = bool(cfg.get("amp", False)) and not cfg.get("bayesian", True) and device.type == "cuda"
+    if amp:
+        model = model.to(memory_format=torch.channels_last)
+        torch.backends.cudnn.benchmark = True
+    print(f"AMP: {amp}")
+
     # ---- Data ----
     dataset = cfg.get("dataset", "covidx")
     if dataset == "covidx":
@@ -184,9 +207,11 @@ def main(cfg: dict):
         test_ds  = CUB200Dataset(root=cfg["data_root"], split="test")
         bs = cfg.get("batch_size", 32)
         nw = cfg.get("num_workers", 4)
-        train_loader = DataLoader(train_ds, bs, shuffle=True,  num_workers=nw, pin_memory=True)
-        val_loader   = DataLoader(val_ds,   bs, shuffle=False, num_workers=nw, pin_memory=True)
-        test_loader  = DataLoader(test_ds,  bs, shuffle=False, num_workers=nw, pin_memory=True)
+        kw = dict(num_workers=nw, pin_memory=True,
+                  persistent_workers=nw > 0, prefetch_factor=4 if nw > 0 else None)
+        train_loader = DataLoader(train_ds, bs, shuffle=True,  drop_last=True, **kw)
+        val_loader   = DataLoader(val_ds,   bs, shuffle=False, **kw)
+        test_loader  = DataLoader(test_ds,  bs, shuffle=False, **kw)
         n_train = len(train_ds)
     else:
         raise ValueError(f"Unknown dataset '{dataset}'")
@@ -210,7 +235,8 @@ def main(cfg: dict):
         t0 = time.time()
 
         train_stats = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, kl_weight, n_train,
+            model, train_loader, optimizer, criterion, device, kl_weight, n_train, amp=amp,
+            freeze_bn=bool(cfg.get("freeze_bn", False)),
         )
         val_stats = evaluate(model, val_loader, criterion, device,
                              n_mc=cfg.get("n_mc_eval", 5))
