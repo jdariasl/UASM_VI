@@ -88,6 +88,9 @@ class Entry:
 
 def load_entries(cfg: dict, ckpt_root: Path, device, args) -> List[Entry]:
     prefix = Path(cfg.get("checkpoint_dir", "checkpoints/cub200_vgg11")).name
+    for suf in ("_reparam", "_flipout"):          # configs point at one estimator's dir
+        if prefix.endswith(suf):
+            prefix = prefix[: -len(suf)]
     dirs = sorted(d for d in ckpt_root.iterdir()
                   if d.is_dir() and d.name.startswith(prefix)
                   and (d / "best_model.pt").exists())

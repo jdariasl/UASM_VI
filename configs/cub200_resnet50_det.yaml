@@ -1,0 +1,31 @@
+# -----------------------------------------------------------------------
+# Config: CUB-200-2011  +  deterministic ResNet-50 (baseline)
+#
+# Trained first; its best_model.pt warm-starts the Bayesian runs
+# (cub200_resnet50.yaml and cub200_resnet50_flipout.yaml via `saved_model`).
+# -----------------------------------------------------------------------
+
+# --- Model ---
+backbone    : resnet50
+bayesian    : false
+n_classes   : 200
+saved_model : ""
+
+checkpoint  : checkpoints/cub200_resnet50/best_model.pt
+
+# --- Data ---
+dataset     : cub200
+data_root   : /media/my_ftp/BasesDeDatos_Imágenes/CUB_200_2011
+
+# --- Training ---
+epochs      : 100
+batch_size  : 64
+lr          : 1.0e-4
+weight_decay: 1.0e-4
+amp         : true      # fp16 autocast + channels_last (deterministic training only)
+kl_weight   : 0.0       # no Bayesian layers
+n_mc_eval   : 1
+
+# --- Output ---
+checkpoint_dir : checkpoints/cub200_resnet50
+num_workers    : 4
