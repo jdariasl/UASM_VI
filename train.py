@@ -66,6 +66,8 @@ def train_one_epoch(
     n_train:    int,
     amp:        bool = False,
     freeze_bn:  bool = False,
+    log_every:  int = 50,
+    epoch:      int = 0,
 ) -> dict:
     model.train()
     if freeze_bn:
@@ -78,8 +80,9 @@ def train_one_epoch(
                 m.eval()
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     total_loss = total_ce = total_kl = correct = n = 0
+    t_start, n_iter = time.time(), len(loader)
 
-    for batch in loader:
+    for it, batch in enumerate(loader, 1):
         # Support optional mask return from COVIDxDataset
         if len(batch) == 3:
             imgs, labels, _ = batch
@@ -110,6 +113,12 @@ def train_one_epoch(
         preds       = logits.argmax(dim=1)
         correct    += (preds == labels).sum().item()
         n          += bs
+
+        if log_every and (it % log_every == 0 or it == 1):
+            el = time.time() - t_start
+            print(f"  [epoch {epoch:3d}] iter {it:4d}/{n_iter} | "
+                  f"loss={total_loss / n:.4f} acc={correct / n:.3f} | "
+                  f"{el / it:.2f}s/it  ETA {el / it * (n_iter - it):.0f}s", flush=True)
 
     return {
         "loss":  total_loss / n,
@@ -237,7 +246,9 @@ def main(cfg: dict):
         train_stats = train_one_epoch(
             model, train_loader, optimizer, criterion, device, kl_weight, n_train, amp=amp,
             freeze_bn=bool(cfg.get("freeze_bn", False)),
+            log_every=int(cfg.get("log_every", 50)), epoch=epoch,
         )
+        print(f"  [epoch {epoch:3d}] training done, evaluating on val...", flush=True)
         val_stats = evaluate(model, val_loader, criterion, device,
                              n_mc=cfg.get("n_mc_eval", 5))
 
@@ -250,7 +261,8 @@ def main(cfg: dict):
             f"(ce={train_stats['ce']:.4f} kl={train_stats['kl']:.4f}) "
             f"acc={train_stats['acc']:.3f} | "
             f"val loss={val_stats['loss']:.4f} acc={val_stats['acc']:.3f} | "
-            f"{elapsed:.1f}s"
+            f"{elapsed:.1f}s",
+            flush=True,
         )
 
         if val_stats["acc"] > best_val_acc:
@@ -260,7 +272,7 @@ def main(cfg: dict):
                         "state_dict": model.state_dict(),
                         "val_acc": best_val_acc,
                         "cfg": cfg}, ckpt_path)
-            print(f"  → Saved best checkpoint (val_acc={best_val_acc:.3f})")
+            print(f"  → Saved best checkpoint (val_acc={best_val_acc:.3f})", flush=True)
 
     # ---- Test evaluation ----
     ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
