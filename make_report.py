@@ -126,7 +126,8 @@ def load_entries(cfg: dict, ckpt_root: Path, device, args) -> List[Entry]:
         if e.bayesian:
             e.twin = SampledTwin(e.model)
         e.lrp = BayesianLRP(e.model, eps=float(cfg.get("lrp_eps", 1e-6)),
-                            eps_std=args.eps_std, fuse_bn=bool(cfg.get("lrp_fuse_bn", True)))
+                            eps_std=args.eps_std, fuse_bn=bool(cfg.get("lrp_fuse_bn", True)),
+                            pool_corr=float(cfg.get("lrp_pool_corr", 0.0)))
         e.ig = BayesianIG(e.model, n_samples=int(cfg.get("n_samples", 20)),
                           m_steps=int(cfg.get("m_steps", 50)),
                           baseline=cfg.get("baseline", "black"),

@@ -38,6 +38,7 @@ n_mc_eval   : 5
 lrp_eps     : 1.0e-6
 lrp_eps_std : 0.1       # tune with tune_eps_std.py: too small -> relevance explodes, too large -> it leaks away
 lrp_fuse_bn : true      # fold BatchNorm into the preceding conv in the LRP backward pass
+lrp_pool_corr : 0.0      # assumed correlation inside avg-pool windows (0 = independent); calibrate with diag_var.py
 
 # --- IG ---
 n_samples   : 20

@@ -151,6 +151,22 @@ weight-space reference for VGG-11 but ~0.3x for ResNet-18/50. `make_report.py` r
 `mc_*` columns (Monte-Carlo, use these at large noise, e.g. MOPED delta 0.5) so you can
 quantify the gap on your trained models. Relevance seed is sign(logit); SNR is scale-invariant.
 
+### Variance diagnostic
+
+```bash
+python diag_var.py --config configs/cub200_resnet50.yaml \
+    --checkpoint checkpoints/cub200_resnet50_reparam/best_model.pt --n_images 3 --n_mc 60 --scales 1 0.3 0.1
+```
+Compares the analytic activation variance with Monte-Carlo (explicit weight draws) layer by layer, for the
+posterior std scaled by each factor. Shows where the closed form loses variance (`first layer with ratio < 0.5`)
+and whether the cause is large-noise non-linearity (ratio -> 1 as the scale shrinks) or ignored covariances
+(ratio stays low; `adjCorr` > 0 means spatially correlated activations through shared conv weights).
+
+`--calibrate_pool_corr` finds, per image, the correlation `rho` inside the global-average-pool window that makes the
+analytic logit variance match Monte-Carlo. A value can be set in the config as `lrp_pool_corr` (default `0.0` = independent
+positions = previous behaviour). It only corrects the pool; if the tool prints `inf`, even full correlation is not enough
+(other covariances matter). Changing it alters the variances that feed the LRP stabiliser, so re-run `tune_eps_std.py` afterwards.
+
 ### Tuning `lrp_eps_std`
 
 ```bash

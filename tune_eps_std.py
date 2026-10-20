@@ -51,7 +51,8 @@ def main():
     print(f"{'eps_std':>8} | conservation per image (sum E[R] * sign(logit)) | median  | mean Var[R]")
     for c in a.values:
         lrp = BayesianLRP(model, eps=float(cfg.get("lrp_eps", 1e-6)), eps_std=c,
-                          fuse_bn=bool(cfg.get("lrp_fuse_bn", True)))
+                          fuse_bn=bool(cfg.get("lrp_fuse_bn", True)),
+                          pool_corr=float(cfg.get("lrp_pool_corr", 0.0)))
         cons, var = [], []
         for x, t in zip(xs, targets):
             mu, v, _ = lrp.explain(x, t)

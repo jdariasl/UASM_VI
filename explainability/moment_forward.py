@@ -233,21 +233,33 @@ def _prop_silu(mu_in, v_in, e_in):
     return _silu_moments(mu_in, v_in)
 
 
-def _prop_pool(mu_in, v_in, e_in, layer):
+def _prop_pool(mu_in, v_in, e_in, layer, rho=0.0):
     """
     Pooling layers.
 
     MaxPool2d : we approximate by propagating the mean; variance is
                 preserved (conservative – pooling reduces variance in
                 practice but bounding it from above is safer for LRP).
-    AdaptiveAvgPool2d : exact – AvgPool is linear.
+    AdaptiveAvgPool2d : the mean is exact (AvgPool is linear).  The variance
+                depends on the covariance between the pooled positions.  With
+                rho = 0 (default) positions are independent, Var = sum(v)/n^2.
+                Conv weights are shared across positions, so in practice their
+                noise is positively correlated: `rho` is the assumed pairwise
+                correlation of the pooled activations,
+                    Var = [ (1-rho) sum v_i + rho (sum sqrt(v_i))^2 ] / n^2 ,
+                interpolating between independence (rho=0) and full correlation
+                (rho=1).  Calibrate it with diag_var.py --calibrate_pool_corr.
     """
     if isinstance(layer, nn.AdaptiveAvgPool2d):
         h_in, w_in = mu_in.shape[-2], mu_in.shape[-1]
         mu_out = layer(mu_in)
         h_out, w_out = mu_out.shape[-2], mu_out.shape[-1]
         n = (h_in // h_out) * (w_in // w_out)
-        v_out  = layer(v_in) / n
+        sum_v  = layer(v_in) * n
+        v_out  = sum_v / n ** 2
+        if rho:
+            sum_sd = layer(v_in.clamp(min=0).sqrt()) * n
+            v_out = ((1.0 - rho) * sum_v + rho * sum_sd ** 2) / n ** 2
         e_out  = mu_out ** 2 + v_out
         return mu_out, v_out, e_out
     elif isinstance(layer, nn.MaxPool2d):
@@ -280,8 +292,9 @@ class MomentForwardPass:
         in the order the layers were visited.  Index 0 is the input.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, pool_corr: float = 0.0):
         self.model = model
+        self.pool_corr = float(pool_corr)     # assumed correlation inside avg-pool windows
         self.layer_stats: List[Dict] = []
 
     # ------------------------------------------------------------------
@@ -432,7 +445,7 @@ class MomentForwardPass:
             self._record(layer, mu, v, e)
 
         elif isinstance(layer, (nn.AdaptiveAvgPool2d, nn.MaxPool2d)):
-            mu, v, e = _prop_pool(mu, v, e, layer)
+            mu, v, e = _prop_pool(mu, v, e, layer, self.pool_corr)
             self._record(layer, mu, v, e)
 
         elif isinstance(layer, nn.Flatten):

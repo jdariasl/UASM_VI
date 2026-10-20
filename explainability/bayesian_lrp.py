@@ -314,13 +314,14 @@ class BayesianLRP:
     """
 
     def __init__(self, model: nn.Module, eps: float = EPS_DEFAULT,
-                 eps_std: float = 0.0, fuse_bn: bool = True):
+                 eps_std: float = 0.0, fuse_bn: bool = True,
+                 pool_corr: float = 0.0):
         from explainability.moment_forward import MomentForwardPass
         self.model    = model.eval()
         self.eps      = eps
         self.eps_std  = eps_std
         self.fuse_bn  = fuse_bn
-        self.mp       = MomentForwardPass(model)
+        self.mp       = MomentForwardPass(model, pool_corr=pool_corr)
         self.last_stats = None          # forward moments of the last explain() call
         self.last_sign  = 1.0           # sign of the explained logit (start relevance)
 
