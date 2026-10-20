@@ -167,6 +167,18 @@ analytic logit variance match Monte-Carlo. A value can be set in the config as `
 positions = previous behaviour). It only corrects the pool; if the tool prints `inf`, even full correlation is not enough
 (other covariances matter). Changing it alters the variances that feed the LRP stabiliser, so re-run `tune_eps_std.py` afterwards.
 
+### Variance-filter evaluation
+
+```bash
+python filter_eval.py --config configs/cub200_resnet50.yaml --n_images 50 --n_mc 30 --outdir results/filter_eval
+```
+Tests whether keeping only low-variance pixels helps. For each Bayesian checkpoint it filters the closed-form
+`E[R]` map by `variance`, `snr`, `var_adj` (variance given magnitude), `magnitude` and `random` at several coverages and
+measures (1) stability over Monte-Carlo weight draws (`jaccard`, `p_pos`, confound-controlled `auc_stable`),
+(2) localisation on the CUB parts (`hit`, `lift`), (3) the risk-coverage curves (`filter_curves.png`, with paired
+differences to the random and magnitude filters in `filter_eval_summary.md`), and (4) faithfulness by deletion/insertion
+(`del_drop`, `ins_gain`). The variance filter is only useful if it beats `random` **and** `magnitude` at equal coverage.
+
 ### Tuning `lrp_eps_std`
 
 ```bash
