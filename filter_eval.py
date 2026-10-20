@@ -28,6 +28,20 @@ highlight those.  Four tests, each at several coverages (fraction of pixels kept
     insert it into the mean image and measure the gain (ins_gain).  Evaluated at
     the mean weights.
 
+ 5. CALIBRATION of the sign confidence.  The closed form predicts, for every pixel,
+    the probability that its relevance keeps the sign of E[R]:
+        p = Phi(|E[R]| / sqrt(Var[R])).
+    Over the K weight draws we observe the fraction of draws in which the sign
+    really is kept.  Reported: reliability curve, ECE, Brier score (against the
+    constant prevalence baseline), for all pixels and for the 20 % most relevant
+    pixels, for
+        closed     Phi(|E|/sqrt V)                      (the method)
+        closed*c   the same with sigma multiplied by the single best constant c
+                   (c >> 1 means the ranking is fine, only the SCALE is wrong)
+        mc_gauss   Phi(sign(E) m / s) with the MC mean m and std s (Gaussian oracle)
+    Files: calibration.csv, calibration.png and a section of filter_eval_summary.md.
+    Use --calibration_only to skip tests 2-4 (much faster).
+
 Filters (each keeps the best `coverage` fraction of pixels)
     variance   lowest closed-form Var[R]                (the idea under test)
     snr        highest |E[R]| / sqrt(Var[R])
@@ -138,6 +152,92 @@ def mc_maps(e, x, target, n_mc, eps):
 
 
 # --------------------------------------------------------------------------- #
+#  Calibration of the sign confidence
+# --------------------------------------------------------------------------- #
+
+def _phi(z: torch.Tensor) -> torch.Tensor:
+    return torch.special.ndtr(z)
+
+
+def _bins(p: np.ndarray, y: np.ndarray, nb: int):
+    """Reliability table over nb equal-width bins of [0, 1]."""
+    ib = np.clip((p * nb).astype(int), 0, nb - 1)
+    rows = []
+    for b in range(nb):
+        m = ib == b
+        if m.any():
+            rows.append((b, float(p[m].mean()), float(y[m].mean()), int(m.sum())))
+    return rows
+
+
+def calib_metrics(p: np.ndarray, y: np.ndarray, nb: int):
+    rows = _bins(p, y, nb)
+    n = sum(r[3] for r in rows)
+    ece = sum(r[3] * abs(r[1] - r[2]) for r in rows) / max(n, 1)
+    brier = float(np.mean((p - y) ** 2))
+    return ece, brier, rows
+
+
+def calibration_report(cal, entries, out: Path, nb: int, md: list):
+    """cal[label] = list of per-image dicts (E, V, agree, mmc, smc: flat float32 arrays)."""
+    cats = {"closed": "#0072B2", "closed*c": "#D55E00", "mc_gauss": "#009E73"}
+    sets = ("all pixels", "top-20% relevant")
+    csv_rows = []
+    fig, axs = plt.subplots(len(sets), len(entries), figsize=(4.0 * len(entries), 3.8 * len(sets)),
+                            squeeze=False)
+    md.append("\n# Calibration of the sign confidence p = Phi(|E[R]|/sqrt(Var[R]))\n")
+    md.append("`agree` = fraction of weight draws whose pixel relevance has the sign of E[R]. ECE: expected "
+              "calibration error, Brier: mean squared error of p against the per-pixel agreement; "
+              "`const` = Brier of the constant prediction (the mean agreement). `c` = best single factor "
+              "multiplying sigma (c >> 1: the variance scale is too small, the ranking may still be fine).\n")
+    md.append("| model | pixels | predictor | c | ECE | Brier | Brier const | mean p | mean agree |\n|---|---|---|---|---|---|---|---|---|")
+    for j, e in enumerate(entries):
+        lab = e.label
+        d = cal[lab]
+        E = np.concatenate([x["E"] for x in d]); V = np.concatenate([x["V"] for x in d])
+        Y = np.concatenate([x["agree"] for x in d])
+        Mm = np.concatenate([x["mmc"] for x in d]); Sm = np.concatenate([x["smc"] for x in d])
+        top = np.concatenate([np.argsort(np.argsort(-np.abs(x["E"]))) < int(0.2 * x["E"].size) for x in d])
+        sE = np.sign(E)
+        for i, (sname, sel) in enumerate(zip(sets, (np.ones_like(top), top))):
+            absE, sig, y = np.abs(E[sel]), np.sqrt(np.maximum(V[sel], 1e-300)), Y[sel]
+            tE = torch.from_numpy(absE.astype(np.float64)); tS = torch.from_numpy(sig.astype(np.float64))
+            tY = torch.from_numpy(y.astype(np.float64))
+            grid = np.logspace(-1.5, 3.5, 61)
+            br = [float(((_phi(tE / (c * tS)) - tY) ** 2).mean()) for c in grid]
+            c_best = float(grid[int(np.argmin(br))])
+            preds = {"closed": _phi(tE / tS).numpy(),
+                     "closed*c": _phi(tE / (c_best * tS)).numpy(),
+                     "mc_gauss": _phi(torch.from_numpy((sE[sel] * Mm[sel]).astype(np.float64)) /
+                                      torch.from_numpy(np.maximum(Sm[sel], 1e-300).astype(np.float64))).numpy()}
+            const = float(np.mean((y - y.mean()) ** 2))
+            ax = axs[i, j]
+            ax.plot([0, 1], [0, 1], "--", color="#999999", lw=1)
+            for nm, p in preds.items():
+                ece, brier, rows = calib_metrics(p, y, nb)
+                md.append(f"| {lab} | {sname} | {nm} | {c_best:.3g} | {ece:.3f} | {brier:.4f} | {const:.4f} | "
+                          f"{p.mean():.3f} | {y.mean():.3f} |" if nm == "closed*c" else
+                          f"| {lab} | {sname} | {nm} | – | {ece:.3f} | {brier:.4f} | {const:.4f} | "
+                          f"{p.mean():.3f} | {y.mean():.3f} |")
+                ax.plot([r[1] for r in rows], [r[2] for r in rows], "-o", ms=3, color=cats[nm],
+                        label=f"{nm} (ECE {ece:.3f})")
+                for (b, mp, my, n) in rows:
+                    csv_rows.append(dict(model=lab, pixels=sname, predictor=nm, c=c_best if nm == "closed*c" else "",
+                                         bin=b, mean_pred=mp, mean_agree=my, n=n))
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+            ax.set_title(f"{lab} - {sname}", fontsize=9)
+            ax.set_xlabel("predicted P(sign kept)"); ax.set_ylabel("observed fraction of draws")
+            ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(out / "calibration.png", dpi=170)
+    plt.close(fig)
+    with open(out / "calibration.csv", "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=["model", "pixels", "predictor", "c", "bin", "mean_pred",
+                                           "mean_agree", "n"])
+        wr.writeheader(); wr.writerows(csv_rows)
+
+
+# --------------------------------------------------------------------------- #
 #  Per (image, model)
 # --------------------------------------------------------------------------- #
 
@@ -155,6 +255,11 @@ def evaluate_pair(e, x, target, parts_mask, args, rng, eps):
     ppos = (MC > 0).mean(0)                              # per-pixel P(relevance > 0)
 
     out = {"mc_spearman_V": spearman(V, MC.var(0, ddof=1)), "n_mc_ok": len(MC)}
+    sE = np.sign(E)
+    out["cal"] = dict(E=E.ravel().astype(np.float32), V=V.ravel().astype(np.float32),
+                      agree=((MC * sE) > 0).mean(0).ravel().astype(np.float32),
+                      mmc=MC.mean(0).ravel().astype(np.float32),
+                      smc=MC.std(0, ddof=1).ravel().astype(np.float32))
 
     # ---- confound-controlled AUROC: among the top-20 % relevant pixels -------
     sc0 = filter_scores(E, V, rng)
@@ -163,6 +268,10 @@ def evaluate_pair(e, x, target, parts_mask, args, rng, eps):
     for name in ("variance", "snr", "var_adj", "magnitude"):
         out[f"auc_stable_{name}"] = auroc(sc0[name].ravel()[top20], stable)
     out["frac_stable_top20"] = float(stable.mean())
+
+    if args.calibration_only:
+        out["records"] = []
+        return out
 
     # ---- masks to evaluate ---------------------------------------------------
     variants = []                                        # (filter, coverage, rep, mask)
@@ -262,6 +371,10 @@ def main():
                     help="coverages (fraction of pixels kept)")
     ap.add_argument("--top_frac", type=float, default=0.05, help="highlight size (fraction of the image)")
     ap.add_argument("--tol", type=float, default=15.0)
+    ap.add_argument("--calibration_only", action="store_true",
+                    help="only the stability AUROC and the calibration of the sign confidence "
+                         "(skips the filter variants and the faithfulness test)")
+    ap.add_argument("--cal_bins", type=int, default=10, help="bins of the reliability diagram")
     ap.add_argument("--eps_std", type=float, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -289,6 +402,7 @@ def main():
     order = random.Random(a.seed).sample(range(len(ds)), len(ds))
     per = {e.label: [] for e in entries}                  # per model: list of dict per image
     aux = {e.label: [] for e in entries}
+    cal = {e.label: [] for e in entries}
     done = 0
     for idx in order:
         if done >= a.n_images:
@@ -314,7 +428,8 @@ def main():
             continue
         for lab, r in res.items():
             per[lab].append(_avg_reps(r["records"]))
-            aux[lab].append({k: v for k, v in r.items() if k != "records"})
+            aux[lab].append({k: v for k, v in r.items() if k not in ("records", "cal")})
+            cal[lab].append(r["cal"])
         done += 1
         print(f"  [{done}/{a.n_images}] image {idx}  ({time.time() - t0:.0f}s)", flush=True)
 
@@ -358,6 +473,7 @@ def main():
                             mm, ss, n = mean_sem(diff)
                             cells.append(f"{mm:+.3f}±{1.96 * ss:.3f}" if n > 1 else "–")
                         md.append(f"| {f} − {ref} | " + " | ".join(cells) + " |")
+    calibration_report(cal, entries, out, a.cal_bins, md)
     (out / "filter_eval_summary.md").write_text("\n".join(md))
     with open(out / "filter_eval_summary.csv", "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=["model", "filter", "coverage", "metric", "mean", "sem", "n"])
@@ -371,6 +487,10 @@ def main():
               "del_drop": "deletion: logit drop", "ins_gain": "insertion: logit gain"}
     col = {"variance": "#1f77b4", "snr": "#2ca02c", "var_adj": "#9467bd",
            "magnitude": "#ff7f0e", "random": "#7f7f7f"}
+    if a.calibration_only:
+        print(f"\nDone in {time.time() - t0:.0f}s -> {out}/")
+        print("\n".join(md[-40:]))
+        return
     fig, axs = plt.subplots(len(METRICS), len(entries), figsize=(4.2 * len(entries), 2.4 * len(METRICS)),
                             squeeze=False, sharex=True)
     for j, e in enumerate(entries):

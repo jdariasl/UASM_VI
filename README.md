@@ -209,3 +209,32 @@ Pick the smallest value for which the conservation sum (`lrp_sum_E`) stays near 
   note    = {Universidad de Antioquia, Intelligent Information Systems Lab}
 }
 ```
+
+## Where the closed form loses variance: covariance oracle (`diag_cov.py`)
+
+Feeds every selected conv / linear / average-pool layer with exact input statistics from Monte-Carlo
+weight draws and measures how much of its output variance each input-covariance structure explains
+(`full` = exact check, `diag` = what `moment_forward.py` assumes, `chan` = keep spatial correlation inside a
+channel, `space` = keep cross-channel correlation at a position).
+
+```bash
+python diag_cov.py --config configs/cub200_resnet50.yaml \
+    --checkpoint checkpoints/cub200_resnet50_reparam/best_model.pt \
+    --n_images 2 --n_mc 60 --every 3 --scales 1.0
+```
+
+Output: `results/diag_cov/cov_oracle_scale1.csv` and a table on screen. `full` must be ~1; `diag << 1` at a layer
+means the diagonal assumption fails at that layer; `gap_frac_chan` / `gap_frac_space` say which correlation
+closes the gap. Use `--every 1` (all layers) or `--layers REGEX` to zoom in.
+
+## Calibration of the sign confidence (`filter_eval.py`)
+
+`filter_eval.py` now also reports, for p = Phi(|E[R]|/sqrt(Var[R])) against the fraction of weight draws that
+keep the sign of E[R]: reliability curves, ECE, Brier score, the best single scale factor `c` for sigma and a
+Gaussian MC oracle (`calibration.csv`, `calibration.png`, section in `filter_eval_summary.md`). To run only this
+part (no filter variants, no faithfulness), which is much faster:
+
+```bash
+python filter_eval.py --config configs/cub200_resnet50.yaml --n_images 50 --n_mc 30 \
+    --calibration_only --outdir results/calibration
+```
