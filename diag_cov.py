@@ -37,6 +37,15 @@ Reading the table (columns are ratios to the Monte-Carlo output variance, 1 = ex
     A layer with diag ~ 1 only appears to lose variance in diag_var.py because of
     what it inherits from earlier layers.
 
+    sh      shared channel correlation: synthetic Gaussian draws with the exact per-element
+            marginals, NO correlation between positions, and ONE channel-correlation matrix
+            (C x C, the mean over positions of the per-position correlation matrices) used at
+            every position.  If sh ~ space, the cross-channel covariance is stationary over
+            positions and can be stored as a single C x C matrix per layer.
+    sh_lr<k>  the same with that matrix replaced by its top-k eigen-directions + a diagonal
+            (is the shared channel covariance itself low-rank?)
+    lr<k>   (--ranks) diagonal + top-k principal components of the full input covariance.
+
 For a Linear layer the 'channels' are the input features and there is no spatial
 dimension: 'chan' = diag and 'space' = full.  For the last Linear layer the ratios of the
 target logit (largest mean logit) are reported too (columns *_t).
@@ -142,6 +151,53 @@ def shuffled(A: torch.Tensor, mode: str, gen: torch.Generator) -> torch.Tensor:
 
 
 @torch.no_grad()
+def shared_channel_corr(A: torch.Tensor):
+    """Mean over positions of the per-position channel correlation matrix, (C, C), unit diagonal."""
+    S, C = A.shape[0], A.shape[1]
+    Ac = A - A.mean(0, keepdim=True)
+    sd = Ac.std(0, unbiased=True, keepdim=True)
+    Z = torch.where(sd > 1e-6, Ac / sd.clamp(min=1e-6), torch.zeros_like(Ac))
+    Zf = Z.permute(0, 2, 3, 1).reshape(-1, C)
+    R = (Zf.T @ Zf) / max(Zf.shape[0], 1) * (S / max(S - 1, 1))
+    d = R.diagonal().clamp(min=1e-8).sqrt()
+    return (R / (d[:, None] * d[None, :])).double(), sd
+
+
+@torch.no_grad()
+def shared_variants(A, lin_var, own, ranks, n_rep, gen):
+    """Variances under 'one channel-correlation matrix for all positions, no spatial correlation'."""
+    S, C = A.shape[0], A.shape[1]
+    R, sd = shared_channel_corr(A)
+    lam, V = torch.linalg.eigh(R)
+    lam, V = lam.flip(0).clamp(min=0), V.flip(1)
+    out, ev = {}, {}
+
+    def run(kind_k):
+        tot = 0.0
+        for _ in range(n_rep):
+            if kind_k is None:                                   # full shared matrix
+                Lf = (V * lam.sqrt()).float()
+                xi = torch.randn(S, C, *A.shape[2:], generator=gen, device=A.device)
+                eta = F.conv2d(xi, Lf[:, :, None, None])
+            else:                                                # top-k + diagonal remainder
+                k = kind_k
+                Lk = (V[:, :k] * lam[:k].sqrt()).float()
+                dres = (1.0 - (V[:, :k] ** 2 * lam[:k]).sum(1)).clamp(min=0).sqrt().float()
+                xi1 = torch.randn(S, k, *A.shape[2:], generator=gen, device=A.device)
+                xi2 = torch.randn(S, C, *A.shape[2:], generator=gen, device=A.device)
+                eta = F.conv2d(xi1, Lk[:, :, None, None]) + dres.view(1, -1, 1, 1) * xi2
+            tot = tot + lin_var(sd * eta)
+        return tot / n_rep + own
+
+    out["sh"] = run(None)
+    for k in ranks:
+        k = int(min(k, C - 1, S - 2))
+        out[f"sh_lr{k}"] = run(k)
+        ev[f"evsh{k}"] = float(lam[:k].sum() / lam.sum().clamp(min=1e-12))
+    return out, ev
+
+
+@torch.no_grad()
 def variants(kind, module, src, A, n_shuffle, gen, ranks=()):
     """Per-element output variances of every variant (dict name -> tensor).
 
@@ -184,6 +240,10 @@ def variants(kind, module, src, A, n_shuffle, gen, ranks=()):
            "space": avg("space") + own}
 
     ev = {}
+    if A.dim() == 4:
+        sres, sev = shared_variants(A, lin_var, own, ranks, n_shuffle, gen)
+        res.update(sres)
+        ev.update(sev)
     if ranks:
         Ac = (A - A.mean(0, keepdim=True)).reshape(S, -1)
         G = (Ac @ Ac.T).double()
@@ -281,7 +341,7 @@ def main():
                     order.append(name)
                 print(f"  scale {s:g} img {ii + 1}/{len(xs)} {name:34s} "
                       f"full {row['full']:.2f} diag {row['diag']:.3f} chan {row['chan']:.3f} "
-                      f"space {row['space']:.3f} {lrs}", flush=True)
+                      f"space {row['space']:.3f} sh {row.get('sh', float('nan')):.3f} {lrs}", flush=True)
                 del A, v_mc, res
                 torch.cuda.empty_cache()
 
@@ -323,6 +383,18 @@ def main():
                       + f" {r['full']:6.2f}")
             print("A small k that brings lrK close to 1 means the missing covariance is low-rank "
                   "(carry K tangent vectors).  PCs are fitted on the same draws: use n_mc >> k.")
+        sh_keys = [f"sh_lr{min(k, a.n_mc - 2)}" for k in a.ranks]
+        sh_rows = [r for r in rows if "sh" in r]
+        if sh_rows:
+            print("\nShared channel correlation (one C x C matrix for all positions, no spatial correlation); "
+                  "sh_lr<k>: that matrix reduced to k directions + diagonal")
+            print(f"{'layer':32s} {'diag':>7s} {'space':>7s} {'sh':>7s} "
+                  + " ".join(f"{k:>9s}" for k in sh_keys if k in sh_rows[0]))
+            for r in sh_rows:
+                print(f"{r['layer'][:32]:32s} {r['diag']:7.3f} {r['space']:7.3f} {r['sh']:7.3f} "
+                      + " ".join(f"{r[k]:9.3f}" for k in sh_keys if k in r))
+            print("sh ~ space: the cross-channel covariance is stationary over positions (one C x C matrix per layer "
+                  "suffices); sh_lr<k> ~ sh: that matrix is low-rank.")
         sub = [r for r in rows if "diag_t" in r]
         if sub:
             r = sub[0]

@@ -238,6 +238,11 @@ python diag_cov.py --config configs/cub200_resnet50.yaml \
     --layers "avgpool|fc|layer4" --every 1 --n_images 2 --n_mc 200 --ranks 1 5 20 50
 ```
 
+For conv and pool layers it also reports `sh`: synthetic draws with the exact marginals, no correlation between
+positions and ONE channel-correlation matrix shared by all positions (`sh_lr<k>`: that matrix reduced to k
+directions plus a diagonal). `sh` close to `space` means the cross-channel covariance is stationary over
+positions (one C x C matrix per layer is enough); `sh_lr<k>` close to `sh` means that matrix is low-rank.
+
 ## Calibration of the sign confidence (`filter_eval.py`)
 
 `filter_eval.py` now also reports, for p = Phi(|E[R]|/sqrt(Var[R])) against the fraction of weight draws that
