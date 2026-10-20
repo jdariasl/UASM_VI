@@ -227,6 +227,17 @@ Output: `results/diag_cov/cov_oracle_scale1.csv` and a table on screen. `full` m
 means the diagonal assumption fails at that layer; `gap_frac_chan` / `gap_frac_space` say which correlation
 closes the gap. Use `--every 1` (all layers) or `--layers REGEX` to zoom in.
 
+`--ranks 1 5 20 50` (default) adds a low-rank oracle: `lr<k>` = diagonal + the top-k principal components of the
+input covariance (columns `ev<k>` give the share of input variance in those components). If a small k brings
+`lr<k>` close to 1 the missing covariance is low-rank. The components are fitted on the same draws, so use
+`--n_mc` >= 4k (k is capped at n_mc-2):
+
+```bash
+python diag_cov.py --config configs/cub200_resnet50.yaml \
+    --checkpoint checkpoints/cub200_resnet50_reparam/best_model.pt \
+    --layers "avgpool|fc|layer4" --every 1 --n_images 2 --n_mc 200 --ranks 1 5 20 50
+```
+
 ## Calibration of the sign confidence (`filter_eval.py`)
 
 `filter_eval.py` now also reports, for p = Phi(|E[R]|/sqrt(Var[R])) against the fraction of weight draws that

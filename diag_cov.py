@@ -142,8 +142,14 @@ def shuffled(A: torch.Tensor, mode: str, gen: torch.Generator) -> torch.Tensor:
 
 
 @torch.no_grad()
-def variants(kind, module, src, A, n_shuffle, gen):
-    """Per-element output variances of every variant (dict name -> tensor)."""
+def variants(kind, module, src, A, n_shuffle, gen, ranks=()):
+    """Per-element output variances of every variant (dict name -> tensor).
+
+    ranks: for each k, 'lr<k>' = diag + the top-k principal components of the input covariance:
+    the draws are split into their rank-k PCA part (kept) and the residual, whose elements
+    are then shuffled independently (marginals kept, residual correlations removed).
+    Returns (res, ev) where ev['ev<k>'] is the share of the total input variance in the top-k PCs.
+    """
     S = A.shape[0]
     ex2 = (A ** 2).mean(0, keepdim=True)
     var_a = A.var(0, unbiased=True, keepdim=True)
@@ -176,7 +182,27 @@ def variants(kind, module, src, A, n_shuffle, gen):
            "diag_shuf": avg("diag") + own,
            "chan": avg("chan") + own,
            "space": avg("space") + own}
-    return res
+
+    ev = {}
+    if ranks:
+        Ac = (A - A.mean(0, keepdim=True)).reshape(S, -1)
+        G = (Ac @ Ac.T).double()
+        w, U = torch.linalg.eigh(G)                         # ascending
+        w, U = w.flip(0).clamp(min=0), U.flip(1).float()
+        tot = float(w.sum()) + 1e-300
+        for k in ranks:
+            k = int(min(k, S - 2))
+            ev[f"ev{k}"] = float(w[:k].sum()) / tot
+            Uk = U[:, :k]
+            L = (Uk @ (Uk.T @ Ac)).reshape(A.shape)
+            Rk = (A - A.mean(0, keepdim=True)) - L
+            acc_ = 0.0
+            for _ in range(n_shuffle):
+                Aq = L + shuffled(Rk, "diag", gen)
+                acc_ = acc_ + lin_var(Aq)
+            res[f"lr{k}"] = acc_ / n_shuffle + own
+            del L, Rk, Aq
+    return res, ev
 
 
 # --------------------------------------------------------------------------- #
@@ -190,6 +216,9 @@ def main():
     ap.add_argument("--n_shuffle", type=int, default=3, help="shuffles averaged per structure")
     ap.add_argument("--every", type=int, default=3, help="use every k-th layer (1 = all)")
     ap.add_argument("--layers", default=None, help="regex on the layer name (applied before --every)")
+    ap.add_argument("--ranks", type=int, nargs="*", default=[1, 5, 20, 50],
+                    help="ranks k of the low-rank-plus-diagonal oracle (empty = skip); k is capped at n_mc-2, "
+                         "so use --n_mc >= 4k for meaningful numbers")
     ap.add_argument("--scales", type=float, nargs="+", default=[1.0])
     ap.add_argument("--outdir", default="results/diag_cov")
     ap.add_argument("--seed", type=int, default=0)
@@ -235,11 +264,12 @@ def main():
                     with torch.no_grad():
                         if mod(A[:1]).shape == A[:1].shape:
                             continue                          # identity pooling
-                res = variants(kind, mod, src, A, a.n_shuffle, gen)
-                row = {}
+                res, ev = variants(kind, mod, src, A, a.n_shuffle, gen, a.ranks)
+                row = dict(ev)
                 tot = float(v_mc.sum())
                 for k, v in res.items():
                     row[k] = float(v.sum()) / max(tot, 1e-30)
+                lrs = " ".join(f"lr{k} {row[f'lr{k}']:.3f}" for k in a.ranks if f"lr{k}" in row)
                 if name == last_linear:
                     with torch.no_grad():
                         mean_logit = F.linear(A.mean(0, keepdim=True), get_weight_moments(src)[0].detach())
@@ -251,7 +281,7 @@ def main():
                     order.append(name)
                 print(f"  scale {s:g} img {ii + 1}/{len(xs)} {name:34s} "
                       f"full {row['full']:.2f} diag {row['diag']:.3f} chan {row['chan']:.3f} "
-                      f"space {row['space']:.3f}", flush=True)
+                      f"space {row['space']:.3f} {lrs}", flush=True)
                 del A, v_mc, res
                 torch.cuda.empty_cache()
 
@@ -281,11 +311,24 @@ def main():
         print("\nfull ~ 1 validates the method.  diag << 1 = the diagonal assumption loses variance AT this layer.\n"
               "chan > diag: correlation between positions of one channel explains it; space > diag: correlation\n"
               "between channels at one position explains it.  (Linear layers: chan = diag, space = full.)")
+        lr_keys = [f"lr{min(k, a.n_mc - 2)}" for k in a.ranks]
+        if lr_keys and lr_keys[0] in rows[0]:
+            print("\nLow-rank oracle: diag + top-k principal components of the input covariance "
+                  "(ratio to MC; ev = share of input variance in those k PCs)")
+            print(f"{'layer':32s} {'diag':>7s} " + " ".join(f"{k:>7s} {'ev' + k[2:]:>6s}" for k in lr_keys)
+                  + f" {'full':>6s}")
+            for r in rows:
+                print(f"{r['layer'][:32]:32s} {r['diag']:7.3f} "
+                      + " ".join(f"{r[k]:7.3f} {r['ev' + k[2:]]:6.2f}" for k in lr_keys)
+                      + f" {r['full']:6.2f}")
+            print("A small k that brings lrK close to 1 means the missing covariance is low-rank "
+                  "(carry K tangent vectors).  PCs are fitted on the same draws: use n_mc >> k.")
         sub = [r for r in rows if "diag_t" in r]
         if sub:
             r = sub[0]
             print(f"target logit at {r['layer']}: full {r['full_t']:.2f}  diag {r['diag_t']:.3f}  "
-                  f"chan {r['chan_t']:.3f}  space {r['space_t']:.3f}")
+                  f"chan {r['chan_t']:.3f}  space {r['space_t']:.3f}  "
+                  + "  ".join(f"{k} {r[k + '_t']:.3f}" for k in lr_keys if k + "_t" in r))
     restore_sigma(model, saved)
     print(f"CSV files in {out}/")
 
