@@ -15,6 +15,7 @@ bayesian    : true
 n_classes   : 200
 estimator   : Reparameterization   # or Flipout
 moped_delta : 0.5
+freeze_bn   : true
 
 saved_model : "checkpoints/cub200_vgg11/best_model.pt"
 
