@@ -6,18 +6,18 @@ computed (a) from Monte-Carlo attribution maps, as in that paper, and (b) in clo
 mean and variance maps of a VI-BNN (BayesianLRP / BayesianGradInput), without sampling.
 
 Definition (paper Eq. 5).  Let R_{m,j} be the relevance of pixel j in the m-th Monte-Carlo map and
-P_alpha the alpha-percentile over m.  With a region of interest `inside` (the lungs there; the
+Q_alpha the alpha-percentile over m.  With a region of interest `inside` (the lungs there; the
 bird bounding box for CUB-200) and its complement `outside`,
 
-    P^alpha_in  = {j in inside  : P_alpha(R_j) > 0},    P^alpha_out = {j in outside : P_alpha(R_j) > 0}
-    IoC_alpha   = mean_{j in P^alpha_out} P_alpha(R_j)  /  mean_{j in P^alpha_in} P_alpha(R_j)
+    S^alpha_in  = {j in inside  : Q_alpha(R_j) > 0},    S^alpha_out = {j in outside : Q_alpha(R_j) > 0}
+    IoC_alpha   = mean_{j in S^alpha_out} Q_alpha(R_j)  /  mean_{j in S^alpha_in} Q_alpha(R_j)
 
 IoC_alpha > 1: the pixels outside the region that are positive at the alpha percentile are, on
 average, more relevant than those inside (a Clever-Hans signature).  Small alpha is demanding
 (a pixel must be positive in at least 100-alpha % of the draws), large alpha is permissive.
 
 Closed form.  With a Gaussian pixel marginal R_j ~ N(mu_j, c^2 v_j),
-    P_alpha(R_j) = mu_j + z_alpha * c * sqrt(v_j),     z_alpha = Phi^{-1}(alpha/100),
+    Q_alpha(R_j) = mu_j + z_alpha * c * sqrt(v_j),     z_alpha = Phi^{-1}(alpha/100),
 and the sets and means above are evaluated on these values.  alpha = 50 gives z = 0: the index
 uses only the mean map.  c >= 1 rescales sigma (the closed-form variance is underestimated; see
 the calibration section of the manuscript).  Colour channels are summed: the pixel relevance is
